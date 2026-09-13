@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import logging
 import os
 from pathlib import Path
@@ -58,7 +59,7 @@ def run(hello: Hello, transport: DiscoveryTransport) -> None:
                       f"endpoint={address[0]}:{peer.tcp_port}", flush=True)
 
 
-def main() -> int:
+def main(runner: Callable[[Hello, DiscoveryTransport], None] = run) -> int:
     """Parse options and run discovery until interrupted."""
     root = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
             if os.name == "nt" else
@@ -84,7 +85,7 @@ def main() -> int:
         print(f"Discovery listening on UDP {args.port}; session={hello.session_id}. "
               "TCP port is advertised only; M1 does not start a TCP service.",
               flush=True)
-        run(hello, transport)
+        runner(hello, transport)
     except KeyboardInterrupt:
         logging.info("Discovery stopped")
     except (OSError, ValueError) as error:
