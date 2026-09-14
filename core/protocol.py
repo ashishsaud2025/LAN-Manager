@@ -1,0 +1,148 @@
+"""Bounded JSON framing and version-one envelopes for all platform clients."""
+
+from __future__ import annotations
+
+import json
+import socket
+import struct
+import time
+from typing import Any
+from uuid import UUID, uuid4
+
+MAX_MESSAGE_SIZE = 1024 * 1024
+IO_TIMEOUT = 5.0
+MESSAGE_TYPES = {"ECHO", "ECHO_REPLY", "CHAT", "ACK", "ERROR"}
+
+
+class ProtocolError(ValueError):
+    """The remote or local message violates the application protocol."""
+
+
+class FramingError(ProtocolError):
+    """A length or premature EOF makes the stream unusable."""
+
+
+def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ProtocolError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _constant(value: str) -> None:
+    raise ProtocolError(f"nonstandard JSON constant: {value}")
+
+
+def encode_message(message: dict[str, Any]) -> bytes:
+    """Encode one object with its unsigned big-endian UTF-8 byte length."""
+    if not isinstance(message, dict):
+        raise ProtocolError("payload must be a JSON object")
+    try:
+        payload = json.dumps(message, ensure_ascii=False, allow_nan=False,
+                             separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError) as error:
+        raise ProtocolError("payload cannot be encoded as UTF-8 JSON") from error
+    if not 1 <= len(payload) <= MAX_MESSAGE_SIZE:
+        raise FramingError("payload length outside allowed range")
+    return struct.pack("!I", len(payload)) + payload
+
+
+def _receive_exact(sock: socket.socket, size: int, deadline: float,
+                   allow_eof: bool = False) -> bytes | None:
+    buffer = bytearray()
+    while len(buffer) < size:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("frame receive deadline exceeded")
+        sock.settimeout(remaining)
+        chunk = sock.recv(size - len(buffer))
+        if not chunk:
+            if not buffer and allow_eof:
+                return None
+            raise FramingError("EOF inside a frame")
+        buffer.extend(chunk)
+    return bytes(buffer)
+
+
+def recv_message(sock: socket.socket,
+                 timeout: float = IO_TIMEOUT) -> dict[str, Any] | None:
+    """Read exactly one frame; return None only for EOF before its prefix."""
+    previous = sock.gettimeout()
+    deadline = time.monotonic() + timeout
+    try:
+        prefix = _receive_exact(sock, 4, deadline, allow_eof=True)
+        if prefix is None:
+            return None
+        length = struct.unpack("!I", prefix)[0]
+        if not 1 <= length <= MAX_MESSAGE_SIZE:
+            raise FramingError("payload length outside allowed range")
+        payload = _receive_exact(sock, length, deadline)
+        try:
+            value = json.loads(payload.decode("utf-8"), object_pairs_hook=_pairs,
+                               parse_constant=_constant)
+            # Re-encoding also rejects lone surrogates and overflowed JSON numbers.
+            encode_message(value)
+        except (ValueError, UnicodeError, RecursionError) as error:
+            raise ProtocolError("invalid UTF-8 JSON object") from error
+        return value
+    finally:
+        sock.settimeout(previous)
+
+
+def send_message(sock: socket.socket, message: dict[str, Any],
+                 timeout: float = IO_TIMEOUT) -> None:
+    """Send a complete frame within a finite write deadline."""
+    frame = encode_message(message)
+    previous = sock.gettimeout()
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(frame)
+    finally:
+        sock.settimeout(previous)
+
+
+def validate_envelope(message: dict[str, Any]) -> None:
+    """Validate version, routing fields, and bodies for implemented message types."""
+    if type(message.get("version")) is not int or message["version"] != 1:
+        raise ProtocolError("unsupported version")
+    if not isinstance(message.get("type"), str) or message["type"] not in MESSAGE_TYPES:
+        raise ProtocolError("unsupported message type")
+    for key in ("message_id", "peer_id", "session_id"):
+        value = message.get(key)
+        try:
+            if not isinstance(value, str) or str(UUID(value)) != value:
+                raise ValueError("noncanonical UUID")
+        except ValueError as error:
+            raise ProtocolError(f"invalid {key}") from error
+    body = message.get("body")
+    if not isinstance(body, dict):
+        raise ProtocolError("body must be an object")
+    if message["type"] in {"ECHO_REPLY", "ACK", "ERROR"}:
+        try:
+            UUID(message.get("reply_to", ""))
+        except (ValueError, TypeError, AttributeError) as error:
+            raise ProtocolError("reply requires reply_to UUID") from error
+    if message["type"] == "CHAT":
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 4096:
+            raise ProtocolError("chat text must contain 1 to 4096 characters")
+        if not isinstance(body.get("scope"), str) or body["scope"] not in {"room", "dm"}:
+            raise ProtocolError("invalid chat scope")
+        if body["scope"] == "dm":
+            try:
+                UUID(body.get("to_session", ""))
+            except (ValueError, TypeError, AttributeError) as error:
+                raise ProtocolError("DM requires recipient session UUID") from error
+
+
+def envelope(kind: str, peer_id: str, session_id: str, body: dict[str, Any],
+             reply_to: str | None = None) -> dict[str, Any]:
+    """Construct a validated request or correlated response."""
+    message = {"version": 1, "type": kind, "message_id": str(uuid4()),
+               "peer_id": peer_id, "session_id": session_id, "body": body}
+    if reply_to is not None:
+        message["reply_to"] = reply_to
+    validate_envelope(message)
+    return message

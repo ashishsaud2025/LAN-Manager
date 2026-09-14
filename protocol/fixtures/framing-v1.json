@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "description": "Generic JSON framing vectors; envelope validation is a separate layer.",
+  "valid": [
+    {"frame_hex": "000000027b7d", "object": {}},
+    {"frame_hex": "0000000d7b2274657874223a226869227d", "object": {"text": "hi"}},
+    {"frame_hex": "0000000a7b2278223a22c3a9227d", "object": {"x": "é"}}
+  ],
+  "invalid_hex": ["00000000", "ffffffff", "000000027b", "000000025b5d"]
+}
