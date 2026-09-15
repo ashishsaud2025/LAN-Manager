@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from queue import Empty
+from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import QTimer, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
-    QComboBox, QLineEdit, QMainWindow, QPushButton, QTextEdit, QVBoxLayout, QWidget,
+    QComboBox, QFileDialog, QLineEdit, QMainWindow, QPushButton, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
 from core.chat import ChatService
@@ -21,6 +24,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.service = service
         self.peers: tuple[Peer, ...] = ()
+        self.transfer_rows: dict[str, dict[str, Any]] = {}
         self.setWindowTitle(f"LAN Manager: {service.hello.name}")
         self.resize(700, 450)
         container = QWidget(self)
@@ -34,11 +38,22 @@ class MainWindow(QMainWindow):
         self.input.setMaxLength(4096)
         self.input.setPlaceholderText("Write a message")
         self.send_button = QPushButton("Send")
-        for widget in (self.recipient, self.log, self.input, self.send_button):
+        self.file_button = QPushButton("Send file to selected peer")
+        self.transfer_list = QComboBox()
+        self.accept_file = QPushButton("Accept selected file offer")
+        self.decline_file = QPushButton("Decline selected offer")
+        self.cancel_file = QPushButton("Cancel selected transfer")
+        for widget in (self.recipient, self.log, self.input, self.send_button,
+                       self.file_button, self.transfer_list, self.accept_file,
+                       self.decline_file, self.cancel_file):
             layout.addWidget(widget)
         self.setCentralWidget(container)
         self.send_button.clicked.connect(self.send)
         self.input.returnPressed.connect(self.send)
+        self.file_button.clicked.connect(self.send_file)
+        self.accept_file.clicked.connect(self.accept_offer)
+        self.decline_file.clicked.connect(self.decline_offer)
+        self.cancel_file.clicked.connect(self.cancel_transfer)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.drain)
         self.timer.start(50)
@@ -89,8 +104,82 @@ class MainWindow(QMainWindow):
             elif kind == "message":
                 self.append(f"{value['body']['scope']} from {value['peer_id']}: "
                             f"{value['body']['text']}")
+            elif kind in {"transfer", "file_offer"}:
+                if kind == "file_offer":
+                    value = {**value, "state": "offer_pending", "total": value["size"]}
+                    self.append(f"File offer: {value['name']!r}, {value['size']} bytes "
+                                f"from {value['peer_id']}. Select it below to accept or decline.")
+                self.update_transfer(value)
             else:
                 self.append(str(value))
+
+    def update_transfer(self, value: dict[str, Any]) -> None:
+        """Display bounded transfer history with explicit progress semantics."""
+        identifier = value["id"]
+        if identifier not in self.transfer_rows:
+            if len(self.transfer_rows) >= 128:
+                for old_id, old in tuple(self.transfer_rows.items()):
+                    if old.get("state") in {"failed", "cancelled", "declined", "saved", "verified"}:
+                        self.transfer_rows.pop(old_id)
+                        self.transfer_list.removeItem(self.transfer_list.findData(old_id))
+                        break
+            self.transfer_rows[identifier] = {}
+            self.transfer_list.addItem(identifier, identifier)
+        row = self.transfer_rows[identifier]
+        row.update(value)
+        progress = ""
+        if "bytes" in row and "total" in row:
+            progress = f" {row['bytes']}/{row['total']} bytes"
+        text = f"{row.get('name', identifier)}: {row['state']}{progress}"
+        self.transfer_list.setItemText(self.transfer_list.findData(identifier), text)
+        if value["state"] in {"failed", "cancelled", "declined", "saved", "verified"}:
+            self.append(f"Transfer {identifier}: {value['state']} "
+                        f"{value.get('message', value.get('path', ''))}")
+
+    @Slot()
+    def send_file(self) -> None:
+        """Select a source file for one explicitly selected peer."""
+        selected = self.recipient.currentData()
+        peer = next((peer for peer in self.peers
+                     if peer.hello.session_id == selected), None)
+        if peer is None:
+            self.append("Select one peer before sending a file.")
+            return
+        filename, _ = QFileDialog.getOpenFileName(self, "Send file")
+        if not filename:
+            return
+        try:
+            identifier = self.service.transfers.send(Path(filename), peer)
+            self.update_transfer({"id": identifier, "name": Path(filename).name,
+                                  "state": "preparing"})
+        except (OSError, ValueError) as error:
+            self.append(str(error))
+
+    @Slot()
+    def accept_offer(self) -> None:
+        """Choose a new destination; the remote filename never selects a path."""
+        identifier = self.transfer_list.currentData()
+        row = self.transfer_rows.get(identifier, {})
+        if row.get("state") != "offer_pending":
+            return
+        filename, _ = QFileDialog.getSaveFileName(self, "Save received file to a new filename")
+        if filename:
+            if self.service.transfers.decide(identifier, Path(filename)):
+                self.update_transfer({"id": identifier, "state": "accepted"})
+            else:
+                self.append("Offer is no longer available.")
+
+    @Slot()
+    def decline_offer(self) -> None:
+        """Decline a still-pending offer."""
+        identifier = self.transfer_list.currentData()
+        if self.transfer_rows.get(identifier, {}).get("state") == "offer_pending":
+            self.service.transfers.decide(identifier, None)
+
+    @Slot()
+    def cancel_transfer(self) -> None:
+        """Cancel selected work without waiting on socket I/O in the GUI."""
+        self.service.transfers.cancel(self.transfer_list.currentData())
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Cancel network work; the entry point joins after the Qt loop exits."""

@@ -16,6 +16,7 @@ from core.protocol import (
     ProtocolError, envelope, recv_message, send_message, validate_envelope,
 )
 from core.roster import Peer, PeerRoster
+from core.transfer import TransferService
 
 
 class ChatService:
@@ -36,6 +37,7 @@ class ChatService:
         self._active: set[socket.socket] = set()
         self._lock = threading.Lock()
         self._seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self.transfers = TransferService(hello, self._event)
 
     def start(self) -> None:
         """Start a single service lifecycle; networking initialization is asynchronous."""
@@ -77,6 +79,7 @@ class ChatService:
     def stop(self) -> None:
         """Request cancellation and interrupt established sockets without blocking UI."""
         self._stop.set()
+        self.transfers.stop()
         with self._lock:
             for conn in self._active:
                 try:
@@ -89,7 +92,8 @@ class ChatService:
         deadline = time.monotonic() + timeout
         for thread in self._threads:
             thread.join(max(0, deadline - time.monotonic()))
-        return not any(thread.is_alive() for thread in self._threads)
+        transfers_done = self.transfers.join(max(0, deadline - time.monotonic()))
+        return transfers_done and not any(thread.is_alive() for thread in self._threads)
 
     def _presence(self) -> None:
         transport = None
@@ -165,6 +169,14 @@ class ChatService:
                     if message is None:
                         continue
                     validate_envelope(message)
+                    if message["type"] == "FILE_OFFER":
+                        dedicated = conn.dup()
+                        try:
+                            self.transfers.receive(dedicated, message)
+                        except (OSError, ProtocolError):
+                            dedicated.close()
+                            raise
+                        continue
                     if message["type"] != "CHAT":
                         raise ProtocolError("chat listener accepts CHAT only")
                     body = message["body"]

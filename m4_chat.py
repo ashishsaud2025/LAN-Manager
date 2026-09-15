@@ -32,7 +32,7 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO)
     try:
         hello = Hello(load_identity(args.identity_file), str(uuid4()), args.name,
-                      args.tcp_port, ("chat_v1",))
+                      args.tcp_port, ("chat_v1", "file_v1"))
         service = ChatService(hello, args.port, args.broadcast, args.reuse_address)
     except (ValueError, OSError) as error:
         logging.error("Startup failed: %s", error)
