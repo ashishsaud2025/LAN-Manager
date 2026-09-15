@@ -146,6 +146,12 @@ class TransferService:
                         transfer.conn.shutdown(socket.SHUT_RDWR)
                     except OSError as error:
                         logging.debug("Transfer shutdown raced close: %s", error)
+                    # Shutdown does not wake a recv blocked on the same
+                    # socket on Windows, so close to interrupt it promptly.
+                    try:
+                        transfer.conn.close()
+                    except OSError as error:
+                        logging.debug("Transfer close raced worker: %s", error)
 
     def stop(self) -> None:
         """Cancel all active work and reject new transfers."""
