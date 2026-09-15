@@ -10,8 +10,11 @@ from typing import Any
 from uuid import UUID, uuid4
 
 MAX_MESSAGE_SIZE = 1024 * 1024
+MAX_FILE_SIZE = 1024 * 1024 * 1024
 IO_TIMEOUT = 5.0
-MESSAGE_TYPES = {"ECHO", "ECHO_REPLY", "CHAT", "ACK", "ERROR"}
+MESSAGE_TYPES = {"ECHO", "ECHO_REPLY", "CHAT", "ACK", "ERROR", "FILE_OFFER",
+                 "FILE_ACCEPT", "FILE_DECLINE", "FILE_CHUNK", "FILE_DONE",
+                 "FILE_RESULT"}
 
 
 class ProtocolError(ValueError):
@@ -135,6 +138,43 @@ def validate_envelope(message: dict[str, Any]) -> None:
                 UUID(body.get("to_session", ""))
             except (ValueError, TypeError, AttributeError) as error:
                 raise ProtocolError("DM requires recipient session UUID") from error
+    if message["type"].startswith("FILE_"):
+        transfer_id = body.get("transfer_id")
+        try:
+            if not isinstance(transfer_id, str) or str(UUID(transfer_id)) != transfer_id:
+                raise ValueError("noncanonical UUID")
+        except ValueError as error:
+            raise ProtocolError("transfer requires transfer_id UUID") from error
+    if message["type"] == "FILE_OFFER":
+        try:
+            UUID(body.get("to_session", ""))
+        except (ValueError, TypeError, AttributeError) as error:
+            raise ProtocolError("offer requires recipient session UUID") from error
+        name = body.get("name")
+        if (not isinstance(name, str) or not name.strip() or len(name) > 255
+                or name in {".", ".."} or any(c in name for c in "/\\:")
+                or any(ord(c) < 32 for c in name)):
+            raise ProtocolError("invalid offered filename")
+        if type(body.get("size")) is not int or not 0 <= body["size"] <= MAX_FILE_SIZE:
+            raise ProtocolError("file size outside allowed range")
+        digest = body.get("sha256")
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)):
+            raise ProtocolError("invalid SHA-256")
+    if message["type"] == "FILE_CHUNK":
+        if type(body.get("offset")) is not int or body["offset"] < 0:
+            raise ProtocolError("chunk requires nonnegative offset")
+        if not isinstance(body.get("data"), str) or not body["data"]:
+            raise ProtocolError("chunk requires Base64 data")
+    if message["type"] == "FILE_RESULT":
+        if body.get("status") != "verified":
+            raise ProtocolError("result requires verified status")
+        if type(body.get("size")) is not int or not 0 <= body["size"] <= MAX_FILE_SIZE:
+            raise ProtocolError("result size outside allowed range")
+        digest = body.get("sha256")
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)):
+            raise ProtocolError("invalid SHA-256")
 
 
 def envelope(kind: str, peer_id: str, session_id: str, body: dict[str, Any],
