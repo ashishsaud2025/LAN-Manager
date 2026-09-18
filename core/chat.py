@@ -81,11 +81,16 @@ class ChatService:
         self._stop.set()
         self.transfers.stop()
         with self._lock:
-            for conn in self._active:
-                try:
-                    conn.shutdown(socket.SHUT_RDWR)
-                except OSError as error:
-                    logging.debug("Shutdown raced connection close: %s", error)
+            conns = tuple(self._active)
+        for conn in conns:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError as error:
+                logging.debug("Shutdown raced connection close: %s", error)
+            try:
+                conn.close()
+            except OSError as error:
+                logging.debug("Close raced worker: %s", error)
 
     def join(self, timeout: float = 6.0) -> bool:
         """Wait outside the UI event loop for workers to release resources."""
