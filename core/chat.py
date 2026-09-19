@@ -13,6 +13,7 @@ from typing import Any
 from uuid import uuid4
 
 from core.discovery import DiscoveryTransport, Hello, encode_hello
+from core.diagnostics import DiagnosticsService
 from core.feed import merge_page, serve_query
 from core.protocol import (
     ProtocolError, envelope, recv_message, send_message, validate_envelope,
@@ -46,11 +47,13 @@ class ChatService:
         self.post_store = post_store
         self._sync_cursors: dict[str, dict[str, Any] | None] = {}
         self.transfers = TransferService(hello, self._event)
+        self.diagnostics = DiagnosticsService(self._event)
 
     def start(self) -> None:
         """Start a single service lifecycle; networking initialization is asynchronous."""
         if self._threads:
             raise RuntimeError("service already started")
+        self.diagnostics.start()
         for target in (self._presence, self._listen, self._receive_worker,
                        self._receive_worker, self._send_worker, self._send_worker):
             thread = threading.Thread(target=target, daemon=True)
@@ -122,6 +125,7 @@ class ChatService:
         """Request cancellation and interrupt established sockets without blocking UI."""
         self._stop.set()
         self.transfers.stop()
+        self.diagnostics.stop()
         with self._lock:
             conns = tuple(self._active)
         for conn in conns:
@@ -140,7 +144,9 @@ class ChatService:
         for thread in self._threads:
             thread.join(max(0, deadline - time.monotonic()))
         transfers_done = self.transfers.join(max(0, deadline - time.monotonic()))
-        return transfers_done and not any(thread.is_alive() for thread in self._threads)
+        diagnostics_done = self.diagnostics.join(max(0, deadline - time.monotonic()))
+        return (transfers_done and diagnostics_done
+                and not any(thread.is_alive() for thread in self._threads))
 
     def _presence(self) -> None:
         transport = None
