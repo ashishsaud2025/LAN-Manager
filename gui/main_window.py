@@ -13,15 +13,17 @@ from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QLabel, QLineEdit, QListView, QMainWindow, QProgressBar, QPushButton,
-    QSplitter, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
+    QSpinBox, QSplitter, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from core.chat import ChatService
+from core.diagnostics import Neighbor, NeighborSnapshot, ProbeResult
 from core.roster import Peer
 from gui.components import NavigationRail, action_button, card, page_header
 from gui.models import (
-    ActivityEntry, ActivityListModel, MessageEntry, MessageListModel,
-    PeerListModel, PostListModel, TransferListModel, capability_label,
+    ActivityEntry, ActivityListModel, AdminDevice, AdminDeviceListModel,
+    MessageEntry, MessageListModel, PeerListModel, PostListModel,
+    TransferListModel, capability_label,
 )
 from gui.theme import apply_theme
 from gui.topology import NetworkTopology
@@ -53,20 +55,24 @@ class MainWindow(QMainWindow):
         self.all_peers: tuple[Peer, ...] = ()
         self.peers: tuple[Peer, ...] = ()
         self.feed_peers: tuple[Peer, ...] = ()
+        self.neighbors: tuple[Neighbor, ...] = ()
         self.transfer_rows: dict[str, dict[str, Any]] = {}
         self.selected_transfer_id: str | None = None
         self.message_outcomes: dict[str, dict[str, str]] = {}
+        self.active_probe_id: str | None = None
+        self.inventory_request_id: str | None = None
         self._next_presence_refresh = 0.0
         self.peer_model = PeerListModel()
         self.message_model = MessageListModel()
         self.transfer_model = TransferListModel()
         self.post_model = PostListModel()
         self.activity_model = ActivityListModel()
+        self.admin_device_model = AdminDeviceListModel()
         self.page_names = ("Overview", "Network", "Devices", "Messages", "Transfers",
-                           "Feed", "Services", "Workbench", "Activity", "Settings")
+                           "Feed", "Services", "Admin", "Activity", "Settings")
         self.navigation_groups = (
             ("Control", (("Overview", PAGE_OVERVIEW), ("Network", PAGE_NETWORK),
-                         ("Devices", PAGE_DEVICES), ("Workbench", PAGE_WORKBENCH))),
+                         ("Devices", PAGE_DEVICES), ("Admin", PAGE_WORKBENCH))),
             ("Share", (("Files", None), ("Transfers", PAGE_TRANSFERS))),
             ("Community", (("Messages", PAGE_MESSAGES), ("Feed", PAGE_FEED),
                            ("Games", None))),
@@ -109,10 +115,7 @@ class MainWindow(QMainWindow):
             "Services", "M8 will publish and browse explicit local projects and services.",
             "Advertised metadata, owner presence, TCP reachability, and application "
             "health will remain separate states."))
-        self.stack.addWidget(self._build_placeholder_page(
-            "Workbench", "Network diagnostics arrive in Phase 2 and Phase 3.",
-            "The first tools will be bounded TCP connect and LAN Manager ECHO probes. "
-            "ICMP ping and a guarded Raw TCP Console follow."))
+        self.stack.addWidget(self._build_admin_page())
         self.stack.addWidget(self._build_activity_page())
         self.stack.addWidget(self._build_settings_page())
         workspace_layout.addWidget(self.stack, 1)
@@ -311,10 +314,10 @@ class MainWindow(QMainWindow):
         self.peer_message_button = action_button("Message", self._message_selected_peer, True)
         self.peer_file_button = action_button("Send file", self._file_selected_peer)
         self.peer_sync_button = action_button("Sync posts", self._sync_selected_peer)
-        self.peer_probe_button = QPushButton("Open Workbench")
-        self.peer_probe_button.setToolTip("Diagnostics are implemented in Phase 2.")
-        self.peer_probe_button.clicked.connect(
-            lambda: self.navigation.select(PAGE_WORKBENCH))
+        self.peer_probe_button = QPushButton("Open in Admin")
+        self.peer_probe_button.setToolTip(
+            "Use this observed endpoint for an explicit ping or TCP check.")
+        self.peer_probe_button.clicked.connect(self._open_peer_admin)
         for button in (self.peer_message_button, self.peer_file_button,
                        self.peer_sync_button, self.peer_probe_button):
             button.setEnabled(False)
@@ -467,6 +470,100 @@ class MainWindow(QMainWindow):
         layout.addWidget(frame, 1)
         return page
 
+    def _build_admin_page(self) -> QWidget:
+        page, layout = self._page(
+            "Admin mode",
+            "Observe local evidence and run bounded checks against one selected endpoint.")
+        scope = QLabel(
+            "Local operator view · no elevated authority. Neighbor-cache rows can be stale "
+            "or incomplete; checks do not establish identity or trust.")
+        scope.setProperty("warning", True)
+        scope.setWordWrap(True)
+        layout.addWidget(scope)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        inventory = QFrame()
+        inventory.setProperty("card", True)
+        inventory_layout = QVBoxLayout(inventory)
+        inventory_header = QHBoxLayout()
+        inventory_title = QLabel("OBSERVED DEVICES")
+        inventory_title.setObjectName("SectionLabel")
+        self.refresh_neighbors_button = action_button(
+            "Refresh neighbor cache", self._refresh_neighbors)
+        inventory_header.addWidget(inventory_title)
+        inventory_header.addStretch(1)
+        inventory_header.addWidget(self.refresh_neighbors_button)
+        inventory_layout.addLayout(inventory_header)
+        self.inventory_status = QLabel(
+            "LAN Atlas sessions appear automatically. Refresh to read the OS neighbor cache.")
+        self.inventory_status.setObjectName("PageSubtitle")
+        self.inventory_status.setWordWrap(True)
+        inventory_layout.addWidget(self.inventory_status)
+        self.admin_device_list = QListView()
+        self.admin_device_list.setModel(self.admin_device_model)
+        self.admin_device_list.setAccessibleName("Observed LAN endpoints")
+        self.admin_device_list.setWordWrap(True)
+        self.admin_device_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.admin_device_list.selectionModel().currentChanged.connect(
+            self._admin_device_selected)
+        inventory_layout.addWidget(self.admin_device_list, 1)
+        inventory_note = QLabel(
+            "This is not a complete device census. Sleeping, isolated, and previously unseen "
+            "hosts may be absent. LAN Atlas sessions and neighbor rows remain separate evidence.")
+        inventory_note.setObjectName("PageSubtitle")
+        inventory_note.setWordWrap(True)
+        inventory_layout.addWidget(inventory_note)
+        splitter.addWidget(inventory)
+
+        controls = QFrame()
+        controls.setProperty("card", True)
+        control_layout = QVBoxLayout(controls)
+        control_title = QLabel("SELECTED CHECK")
+        control_title.setObjectName("SectionLabel")
+        control_layout.addWidget(control_title)
+        self.admin_selection = QLabel("Enter an IPv4 address or select an observation")
+        self.admin_selection.setObjectName("PageSubtitle")
+        self.admin_selection.setWordWrap(True)
+        control_layout.addWidget(self.admin_selection)
+        address_label = QLabel("Numeric IPv4 address")
+        address_label.setObjectName("MetricLabel")
+        self.admin_address = QLineEdit()
+        self.admin_address.setPlaceholderText("192.168.1.20")
+        self.admin_address.setAccessibleName("Diagnostic IPv4 address")
+        port_label = QLabel("TCP port")
+        port_label.setObjectName("MetricLabel")
+        self.admin_port = QSpinBox()
+        self.admin_port.setRange(1, 65535)
+        self.admin_port.setValue(80)
+        self.admin_port.setAccessibleName("Diagnostic TCP port")
+        control_layout.addWidget(address_label)
+        control_layout.addWidget(self.admin_address)
+        control_layout.addWidget(port_label)
+        control_layout.addWidget(self.admin_port)
+        actions = QGridLayout()
+        self.admin_ping_button = action_button("Ping selected", self._ping_admin_target, True)
+        self.admin_tcp_button = action_button("Check TCP port", self._tcp_admin_target)
+        self.admin_cancel_button = action_button("Cancel current check", self._cancel_admin_probe)
+        self.admin_cancel_button.setEnabled(False)
+        actions.addWidget(self.admin_ping_button, 0, 0)
+        actions.addWidget(self.admin_tcp_button, 0, 1)
+        actions.addWidget(self.admin_cancel_button, 1, 0, 1, 2)
+        control_layout.addLayout(actions)
+        self.admin_result = QLabel(
+            "No check has run. Ping and TCP are separate evidence; failed ping does not prove "
+            "that a TCP service is unavailable.")
+        self.admin_result.setWordWrap(True)
+        self.admin_result.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.admin_result.setProperty("chip", True)
+        control_layout.addWidget(self.admin_result)
+        control_layout.addStretch(1)
+        splitter.addWidget(controls)
+        splitter.setSizes([560, 420])
+        layout.addWidget(splitter, 1)
+        return page
+
     def _build_activity_page(self) -> QWidget:
         page, layout = self._page(
             "Activity", "Operational events stay separate from human conversations.")
@@ -589,6 +686,134 @@ class MainWindow(QMainWindow):
         self.overview_activity_view.scrollToBottom()
 
     @Slot()
+    def _refresh_neighbors(self) -> None:
+        try:
+            self.inventory_request_id = self.service.diagnostics.refresh_neighbors()
+        except RuntimeError as error:
+            self.append(str(error), "Admin", "warning")
+            return
+        self.refresh_neighbors_button.setEnabled(False)
+        self.inventory_status.setText("Reading the operating system neighbor cache...")
+
+    @Slot()
+    def _ping_admin_target(self) -> None:
+        self._queue_admin_probe("ping")
+
+    @Slot()
+    def _tcp_admin_target(self) -> None:
+        self._queue_admin_probe("tcp")
+
+    def _queue_admin_probe(self, kind: str) -> None:
+        address = self.admin_address.text().strip()
+        try:
+            if kind == "ping":
+                identifier = self.service.diagnostics.ping(address)
+            else:
+                identifier = self.service.diagnostics.tcp_connect(
+                    address, self.admin_port.value())
+        except (RuntimeError, ValueError) as error:
+            self.admin_address.setFocus()
+            self.admin_result.setText(str(error))
+            self.append(str(error), "Admin", "warning")
+            return
+        self.active_probe_id = identifier
+        self.admin_ping_button.setEnabled(False)
+        self.admin_tcp_button.setEnabled(False)
+        self.admin_result.setText(f"{kind.upper()} check queued for {address}")
+
+    @Slot()
+    def _cancel_admin_probe(self) -> None:
+        self.service.diagnostics.cancel()
+        self.admin_cancel_button.setEnabled(False)
+        self.admin_result.setText("Cancellation requested")
+
+    @Slot(QModelIndex, QModelIndex)
+    def _admin_device_selected(self, current: QModelIndex,
+                               previous: QModelIndex = QModelIndex()) -> None:
+        del previous
+        device = self.admin_device_model.device_at(current.row())
+        if device is None:
+            return
+        self.admin_address.setText(device.address)
+        if device.port is not None:
+            self.admin_port.setValue(device.port)
+        self.admin_selection.setText(
+            f"{device.label} · {device.source}\n{device.detail}")
+
+    def _rebuild_admin_devices(self) -> None:
+        selected = self.admin_device_model.device_at(
+            self.admin_device_list.currentIndex().row())
+        selected_key = selected.key if selected is not None else None
+        devices = [AdminDevice(
+            f"peer:{peer.hello.session_id}", peer.hello.name, peer.ip,
+            "LAN Atlas HELLO",
+            f"Recent unverified session; not authenticated · "
+            f"{', '.join(peer.hello.capabilities) or 'presence only'}",
+            peer.hello.tcp_port) for peer in self.all_peers]
+        devices.extend(AdminDevice(
+            f"neighbor:{neighbor.interface or ''}:{neighbor.address}",
+            f"Neighbor {neighbor.address}", neighbor.address, "OS neighbor cache",
+            " · ".join(part for part in (
+                f"MAC {neighbor.mac_address}" if neighbor.mac_address else "MAC unavailable",
+                f"interface {neighbor.interface}" if neighbor.interface else "interface unavailable",
+                f"state {neighbor.state}" if neighbor.state else "state unavailable") if part))
+            for neighbor in self.neighbors)
+        devices.sort(key=lambda item: (item.source != "LAN Atlas HELLO", item.label.lower(),
+                                       item.address))
+        self.admin_device_model.set_devices(tuple(devices))
+        row = next((index for index, device in enumerate(devices)
+                    if device.key == selected_key), -1)
+        if row >= 0:
+            self.admin_device_list.setCurrentIndex(
+                self.admin_device_model.index(row, 0))
+        elif selected_key is not None:
+            self.admin_device_list.setCurrentIndex(QModelIndex())
+
+    def _show_neighbor_snapshot(self, snapshot: NeighborSnapshot) -> None:
+        if (self.inventory_request_id is not None
+                and snapshot.request_id != self.inventory_request_id):
+            return
+        self.inventory_request_id = None
+        self.refresh_neighbors_button.setEnabled(True)
+        if snapshot.error:
+            self.inventory_status.setText(f"Neighbor refresh unavailable: {snapshot.error}")
+            self.append(f"Neighbor refresh unavailable: {snapshot.error}",
+                        "Admin", "warning")
+            return
+        self.neighbors = snapshot.entries
+        self.inventory_status.setText(
+            f"{len(snapshot.entries)} neighbor-cache entr"
+            f"{'y' if len(snapshot.entries) == 1 else 'ies'} observed. "
+            "Rows may be stale or incomplete.")
+        self._rebuild_admin_devices()
+        self.append(f"Observed {len(snapshot.entries)} OS neighbor-cache entries.", "Admin")
+
+    def _show_probe_started(self, result: ProbeResult) -> None:
+        if result.request_id != self.active_probe_id:
+            return
+        endpoint = (f"{result.address}:{result.port}"
+                    if result.port is not None else result.address)
+        self.admin_result.setText(f"Running {result.kind.upper()} check for {endpoint}...")
+        self.admin_cancel_button.setEnabled(True)
+
+    def _show_probe_result(self, result: ProbeResult) -> None:
+        endpoint = (f"{result.address}:{result.port}"
+                    if result.port is not None else result.address)
+        duration = (f" · {result.duration_ms:.1f} ms local operation time"
+                    if result.duration_ms is not None else "")
+        detail = f"\n{result.detail}" if result.detail else ""
+        text = f"{result.kind.upper()} {endpoint}: {result.state}{duration}{detail}"
+        self.append(text.replace("\n", " · "), "Admin",
+                    "warning" if result.state not in {"reachable"} else "info")
+        if result.request_id != self.active_probe_id:
+            return
+        self.active_probe_id = None
+        self.admin_result.setText(text)
+        self.admin_ping_button.setEnabled(True)
+        self.admin_tcp_button.setEnabled(True)
+        self.admin_cancel_button.setEnabled(False)
+
+    @Slot()
     def send(self) -> None:
         """Queue a room or direct message without blocking the GUI."""
         text = self.input.text()
@@ -645,6 +870,12 @@ class MainWindow(QMainWindow):
                 self.refresh_feed()
             elif kind == "post_published":
                 self.refresh_feed()
+            elif kind == "neighbor_snapshot":
+                self._show_neighbor_snapshot(value)
+            elif kind == "diagnostic_started":
+                self._show_probe_started(value)
+            elif kind == "diagnostic_result":
+                self._show_probe_result(value)
             else:
                 text = str(value)
                 if text.startswith("TCP listener stopped"):
@@ -674,6 +905,7 @@ class MainWindow(QMainWindow):
         self.feed_peers = tuple(peer for peer in peers
                                 if "posts_v1" in peer.hello.capabilities)
         self.peer_model.set_peers(peers)
+        self._rebuild_admin_devices()
         self.topology.set_peers(peers)
         self.overview_topology.set_peers(peers)
         self.overview_nearby_stack.setCurrentWidget(
@@ -792,6 +1024,23 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self.recipient.setCurrentIndex(index)
             self.navigation.select(PAGE_MESSAGES)
+
+    def _open_peer_admin(self) -> None:
+        peer = self._selected_peer()
+        if peer is None:
+            return
+        self.admin_address.setText(peer.ip)
+        self.admin_port.setValue(peer.hello.tcp_port)
+        self.admin_selection.setText(
+            f"{peer.hello.name} · LAN Atlas HELLO\n"
+            "Endpoint is observed and advertised, not authenticated.")
+        key = f"peer:{peer.hello.session_id}"
+        row = next((index for index, device in enumerate(self.admin_device_model.devices)
+                    if device.key == key), -1)
+        if row >= 0:
+            self.admin_device_list.setCurrentIndex(
+                self.admin_device_model.index(row, 0))
+        self.navigation.select(PAGE_WORKBENCH)
 
     def _file_selected_peer(self) -> None:
         peer = self._selected_peer()

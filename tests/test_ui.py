@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 
 from core.chat import ChatService
+from core.diagnostics import Neighbor, NeighborSnapshot, ProbeResult
 from core.discovery import Hello
 from core.protocol import envelope
 from core.roster import Peer
@@ -82,6 +83,48 @@ def test_overview_surfaces_live_network_and_activity(window: object) -> None:
 def test_security_chip_opens_security_details(window: object) -> None:
     window.security_status.click()
     assert window.stack.currentIndex() == 9
+
+
+def test_admin_inventory_keeps_neighbor_and_peer_evidence_separate(window: object) -> None:
+    peer = _peer()
+    window.service.events.put(("roster", (peer,)))
+    window.service.events.put(("neighbor_snapshot", NeighborSnapshot(
+        "refresh-one", (Neighbor(peer.ip, "00:11:22:33:44:55", "Wi-Fi", "stale"),),
+        "OS neighbor cache")))
+    window.drain()
+    assert window.admin_device_model.rowCount() == 2
+    assert {device.source for device in window.admin_device_model.devices} == {
+        "LAN Atlas HELLO", "OS neighbor cache"}
+
+
+def test_device_inspector_prefills_admin_target(window: object) -> None:
+    peer = _peer()
+    window.service.events.put(("roster", (peer,)))
+    window.drain()
+    window._open_peer_admin()
+    assert window.stack.currentIndex() == 7
+    assert window.admin_address.text() == peer.ip
+    assert window.admin_port.value() == peer.hello.tcp_port
+    assert "not authenticated" in window.admin_selection.text()
+
+
+def test_admin_probe_result_is_operational_activity(window: object,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    identifier = str(uuid4())
+    monkeypatch.setattr(window.service.diagnostics, "ping", lambda address: identifier)
+    window.admin_address.setText("192.168.1.20")
+    window._ping_admin_target()
+    window.service.events.put(("diagnostic_started", ProbeResult(
+        identifier, "ping", "192.168.1.20", None, "running")))
+    window.service.events.put(("diagnostic_result", ProbeResult(
+        identifier, "ping", "192.168.1.20", None, "no_reply", 120.0,
+        "ICMP did not reply")))
+    before_messages = window.message_model.rowCount()
+    window.drain()
+    assert "no_reply" in window.admin_result.text()
+    assert window.activity_model.rowCount() >= 1
+    assert window.message_model.rowCount() == before_messages
+    assert window.admin_ping_button.isEnabled()
 
 
 def test_topology_tracks_observed_sessions(window: object) -> None:

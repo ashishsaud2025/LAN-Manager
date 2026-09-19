@@ -35,6 +35,59 @@ class MessageEntry:
     outgoing: bool
 
 
+@dataclass(frozen=True)
+class AdminDevice:
+    """One observed endpoint with an explicit evidence source."""
+
+    key: str
+    label: str
+    address: str
+    source: str
+    detail: str
+    port: int | None = None
+
+
+class AdminDeviceListModel(QAbstractListModel):
+    """Present LAN observations without merging identities by address."""
+
+    DeviceRole = Qt.ItemDataRole.UserRole + 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.devices: tuple[AdminDevice, ...] = ()
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.devices)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if not index.isValid() or not 0 <= index.row() < len(self.devices):
+            return None
+        device = self.devices[index.row()]
+        endpoint = (f"{device.address}:{device.port}"
+                    if device.port is not None else device.address)
+        if role == Qt.ItemDataRole.DisplayRole:
+            return f"{device.label}\n{endpoint} · {device.source}\n{device.detail}"
+        if role == self.DeviceRole:
+            return device
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return (f"Evidence source: {device.source}\n{device.detail}\n"
+                    "An observation is not identity or administrative authority.")
+        if role == Qt.ItemDataRole.AccessibleTextRole:
+            return (f"{device.label}, address {endpoint}, source {device.source}, "
+                    f"{device.detail}")
+        return None
+
+    def set_devices(self, devices: tuple[AdminDevice, ...]) -> None:
+        """Replace one complete combined observation snapshot."""
+        self.beginResetModel()
+        self.devices = devices
+        self.endResetModel()
+
+    def device_at(self, row: int) -> AdminDevice | None:
+        """Return one observed endpoint by visible row."""
+        return self.devices[row] if 0 <= row < len(self.devices) else None
+
+
 class PeerListModel(QAbstractListModel):
     """Expose immutable roster snapshots while preserving session identity."""
 

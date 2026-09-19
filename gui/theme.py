@@ -106,7 +106,7 @@ def _stylesheet(c: dict[str, str]) -> str:
         }}
         QPushButton:hover {{ border-color: {c['accent']}; color: {c['signal']}; }}
         QPushButton:pressed {{ background: {c['selection']}; }}
-        QPushButton:focus, QLineEdit:focus, QComboBox:focus,
+        QPushButton:focus, QLineEdit:focus, QSpinBox:focus, QComboBox:focus,
         QTextEdit:focus, QPlainTextEdit:focus, QListView:focus {{
             border: 2px solid {c['signal']};
         }}
@@ -120,9 +120,12 @@ def _stylesheet(c: dict[str, str]) -> str:
             color: {c['warning_text']}; background: {c['warning_bg']};
             border: 1px solid {c['warning_border']}; padding: 6px 9px;
         }}
-        QLineEdit, QComboBox, QTextEdit, QPlainTextEdit, QListView {{
+        QLineEdit, QSpinBox, QComboBox, QTextEdit, QPlainTextEdit, QListView {{
             background: {c['field']}; color: {c['ink']}; border: 1px solid {c['border']};
             border-radius: 6px; padding: 7px; selection-background-color: {c['accent']};
+        }}
+        QSpinBox::up-button, QSpinBox::down-button {{
+            background: {c['raised']}; border: 0; width: 16px;
         }}
         QComboBox QAbstractItemView {{
             background: {c['raised']}; color: {c['ink']}; selection-background-color: {c['accent']};
