@@ -82,6 +82,13 @@ class ChatService:
             except Full:
                 self._event("status", f"Failed {message['message_id']} to "
                             f"{peer.hello.name}: outbound queue full")
+                self._event("message_outcome", {
+                    "message_id": message["message_id"],
+                    "session_id": peer.hello.session_id,
+                    "peer_name": peer.hello.name,
+                    "state": "failed",
+                    "detail": "outbound queue full",
+                })
         return message["message_id"]
 
     def publish_post(self, text: str, refs: list[dict[str, Any]] | None = None) -> str:
@@ -93,7 +100,7 @@ class ChatService:
                 "refs": refs or []}
         if not self.post_store.add(post):
             raise RuntimeError("generated duplicate post ID")
-        self._event("feed_updated", {"added": 1, "duplicates": 0})
+        self._event("post_published", {"post_id": post["post_id"]})
         return post["post_id"]
 
     def sync_posts(self, peer: Peer) -> str:
@@ -158,7 +165,7 @@ class ChatService:
                         hello, address = result
                         roster.update(hello, address[0], time.monotonic())
                 peers = roster.snapshot()
-                visible = tuple((peer.hello, peer.ip) for peer in peers)
+                visible = peers
                 if visible != published and self._event("roster", peers):
                     published = visible
         except OSError as error:
@@ -279,9 +286,23 @@ class ChatService:
                             or reply["body"].get("status") != "accepted"):
                         raise ProtocolError("invalid acknowledgement")
                 self._event("status", f"Accepted {message['message_id']} by {peer.hello.name}")
+                self._event("message_outcome", {
+                    "message_id": message["message_id"],
+                    "session_id": peer.hello.session_id,
+                    "peer_name": peer.hello.name,
+                    "state": "accepted",
+                    "detail": "accepted by receiving application",
+                })
             except (OSError, ValueError) as error:
                 self._event("status", f"Failed {message['message_id']} to "
                             f"{peer.hello.name}: {error}")
+                self._event("message_outcome", {
+                    "message_id": message["message_id"],
+                    "session_id": peer.hello.session_id,
+                    "peer_name": peer.hello.name,
+                    "state": "failed",
+                    "detail": str(error),
+                })
             finally:
                 if conn is not None:
                     conn.close()

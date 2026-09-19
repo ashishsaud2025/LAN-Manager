@@ -96,7 +96,7 @@ def test_publish_post_emits_update_and_persists(tmp_path: Path) -> None:
     service = ChatService(hello, post_store=JsonLinesPostStore(path))
     identifier = service.publish_post("Hello feed")
     assert service.events.get(timeout=1) == (
-        "feed_updated", {"added": 1, "duplicates": 0})
+        "post_published", {"post_id": identifier})
     reopened = JsonLinesPostStore(path)
     assert reopened.get(identifier)["text"] == "Hello feed"
 
