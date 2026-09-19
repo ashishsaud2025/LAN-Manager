@@ -9,12 +9,14 @@ import time
 from typing import Any
 from uuid import UUID, uuid4
 
+from core.posts import PAGE_LIMIT_MAX, validate_cursor, validate_post
+
 MAX_MESSAGE_SIZE = 1024 * 1024
 MAX_FILE_SIZE = 1024 * 1024 * 1024
 IO_TIMEOUT = 5.0
 MESSAGE_TYPES = {"ECHO", "ECHO_REPLY", "CHAT", "ACK", "ERROR", "FILE_OFFER",
                  "FILE_ACCEPT", "FILE_DECLINE", "FILE_CHUNK", "FILE_DONE",
-                 "FILE_RESULT"}
+                 "FILE_RESULT", "POST_QUERY", "POST_PAGE"}
 
 
 class ProtocolError(ValueError):
@@ -175,6 +177,39 @@ def validate_envelope(message: dict[str, Any]) -> None:
         if (not isinstance(digest, str) or len(digest) != 64
                 or any(c not in "0123456789abcdef" for c in digest)):
             raise ProtocolError("invalid SHA-256")
+    if message["type"] == "POST_QUERY":
+        try:
+            validate_cursor(body.get("cursor"))
+        except ValueError as error:
+            raise ProtocolError("invalid post cursor") from error
+        if type(body.get("limit")) is not int or not 1 <= body["limit"] <= PAGE_LIMIT_MAX:
+            raise ProtocolError("post page limit must be 1 to 50")
+        author = body.get("author_id")
+        if author is not None:
+            try:
+                if str(UUID(author)) != author:
+                    raise ValueError("noncanonical UUID")
+            except (ValueError, TypeError, AttributeError) as error:
+                raise ProtocolError("invalid post author filter") from error
+    if message["type"] == "POST_PAGE":
+        posts = body.get("posts")
+        if not isinstance(posts, list) or len(posts) > PAGE_LIMIT_MAX:
+            raise ProtocolError("post page must list at most 50 posts")
+        try:
+            for post in posts:
+                validate_post(post)
+        except ValueError as error:
+            raise ProtocolError("invalid post in page") from error
+        try:
+            next_cursor = validate_cursor(body.get("next_cursor"))
+        except ValueError as error:
+            raise ProtocolError("invalid post next cursor") from error
+        if type(body.get("complete")) is not bool:
+            raise ProtocolError("post page requires complete flag")
+        if not posts and not body["complete"]:
+            raise ProtocolError("empty post page must be complete")
+        if not body["complete"] and next_cursor is None:
+            raise ProtocolError("incomplete post page requires next cursor")
 
 
 def envelope(kind: str, peer_id: str, session_id: str, body: dict[str, Any],
