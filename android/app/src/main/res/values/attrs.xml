@@ -1,0 +1,14 @@
+<resources>
+    <attr name="lanCanvas" format="color" />
+    <attr name="lanSurface" format="color" />
+    <attr name="lanRaised" format="color" />
+    <attr name="lanBorder" format="color" />
+    <attr name="lanPrimaryText" format="color" />
+    <attr name="lanSecondaryText" format="color" />
+    <attr name="lanAccent" format="color" />
+    <attr name="lanOnAccent" format="color" />
+    <attr name="lanSignal" format="color" />
+    <attr name="lanWarning" format="color" />
+    <attr name="lanWarningSurface" format="color" />
+    <attr name="lanWarningText" format="color" />
+</resources>

@@ -1,0 +1,95 @@
+<resources>
+    <style name="Theme.LanAtlas.Observatory" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:colorAccent">@color/observatory_accent</item>
+        <item name="android:windowBackground">@color/observatory_canvas</item>
+        <item name="android:navigationBarColor">@color/observatory_surface</item>
+        <item name="android:statusBarColor">@color/observatory_canvas</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="lanCanvas">@color/observatory_canvas</item>
+        <item name="lanSurface">@color/observatory_surface</item>
+        <item name="lanRaised">@color/observatory_raised</item>
+        <item name="lanBorder">@color/observatory_border</item>
+        <item name="lanPrimaryText">@color/observatory_primary</item>
+        <item name="lanSecondaryText">@color/observatory_secondary</item>
+        <item name="lanAccent">@color/observatory_accent</item>
+        <item name="lanOnAccent">@color/observatory_on_accent</item>
+        <item name="lanSignal">@color/observatory_signal</item>
+        <item name="lanWarning">@color/observatory_warning</item>
+        <item name="lanWarningSurface">@color/observatory_warning_surface</item>
+        <item name="lanWarningText">@color/observatory_warning_text</item>
+    </style>
+
+    <style name="Theme.LanAtlas.Atlas" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:colorAccent">@color/atlas_accent</item>
+        <item name="android:windowBackground">@color/atlas_canvas</item>
+        <item name="android:navigationBarColor">@color/atlas_surface</item>
+        <item name="android:statusBarColor">@color/atlas_canvas</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="lanCanvas">@color/atlas_canvas</item>
+        <item name="lanSurface">@color/atlas_surface</item>
+        <item name="lanRaised">@color/atlas_raised</item>
+        <item name="lanBorder">@color/atlas_border</item>
+        <item name="lanPrimaryText">@color/atlas_primary</item>
+        <item name="lanSecondaryText">@color/atlas_secondary</item>
+        <item name="lanAccent">@color/atlas_accent</item>
+        <item name="lanOnAccent">@color/atlas_on_accent</item>
+        <item name="lanSignal">@color/atlas_signal</item>
+        <item name="lanWarning">@color/atlas_warning</item>
+        <item name="lanWarningSurface">@color/atlas_warning_surface</item>
+        <item name="lanWarningText">@color/atlas_warning_text</item>
+    </style>
+
+    <style name="Widget.LanAtlas.Card" parent="">
+        <item name="android:background">@drawable/bg_card</item>
+        <item name="android:padding">16dp</item>
+    </style>
+    <style name="Widget.LanAtlas.Title" parent="">
+        <item name="android:textColor">?attr/lanPrimaryText</item>
+        <item name="android:textSize">24sp</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+    <style name="Widget.LanAtlas.Subtitle" parent="">
+        <item name="android:textColor">?attr/lanSecondaryText</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:lineSpacingExtra">2dp</item>
+    </style>
+    <style name="Widget.LanAtlas.Label" parent="">
+        <item name="android:textColor">?attr/lanSecondaryText</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:textAllCaps">true</item>
+        <item name="android:letterSpacing">0.08</item>
+    </style>
+    <style name="Widget.LanAtlas.Value" parent="">
+        <item name="android:textColor">?attr/lanPrimaryText</item>
+        <item name="android:textSize">18sp</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+    <style name="Widget.LanAtlas.Input" parent="android:style/Widget.Material.EditText">
+        <item name="android:textColor">?attr/lanPrimaryText</item>
+        <item name="android:textColorHint">?attr/lanSecondaryText</item>
+        <item name="android:backgroundTint">?attr/lanAccent</item>
+        <item name="android:minHeight">48dp</item>
+    </style>
+    <style name="Widget.LanAtlas.Button" parent="android:style/Widget.Material.Button">
+        <item name="android:textColor">?attr/lanPrimaryText</item>
+        <item name="android:backgroundTint">?attr/lanRaised</item>
+        <item name="android:minHeight">48dp</item>
+    </style>
+    <style name="Widget.LanAtlas.Button.Primary" parent="Widget.LanAtlas.Button">
+        <item name="android:textColor">?attr/lanOnAccent</item>
+        <item name="android:backgroundTint">?attr/lanAccent</item>
+    </style>
+    <style name="Widget.LanAtlas.NavButton" parent="android:style/Widget.Material.Button.Borderless">
+        <item name="android:textColor">@color/nav_text</item>
+        <item name="android:backgroundTint">@color/nav_background</item>
+        <item name="android:textSize">11sp</item>
+        <item name="android:minHeight">56dp</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:paddingLeft">2dp</item>
+        <item name="android:paddingRight">2dp</item>
+    </style>
+</resources>

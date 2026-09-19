@@ -1,0 +1,319 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/app_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fitsSystemWindows="true"
+    android:orientation="vertical">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="12dp"
+        android:background="@drawable/bg_card"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:padding="12dp">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/app_name"
+                android:textColor="?attr/lanPrimaryText"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+            <TextView
+                android:id="@+id/top_session_summary"
+                style="@style/Widget.LanAtlas.Subtitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/foreground_only" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/top_nearby"
+            style="@style/Widget.LanAtlas.Subtitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="8dp"
+            android:text="@string/zero_nearby" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_warning"
+            android:contentDescription="@string/unverified_detail"
+            android:text="@string/unverified_lan"
+            android:textColor="?attr/lanWarningText"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <FrameLayout
+        android:id="@+id/page_container"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <ScrollView
+            android:id="@+id/page_overview"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:fillViewport="true">
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+                <TextView style="@style/Widget.LanAtlas.Title"
+                    android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:text="@string/local_overview" />
+                <TextView style="@style/Widget.LanAtlas.Subtitle"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:layout_marginBottom="16dp" android:text="@string/overview_subtitle" />
+
+                <LinearLayout style="@style/Widget.LanAtlas.Card"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:orientation="vertical">
+                    <TextView style="@style/Widget.LanAtlas.Label"
+                        android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:text="@string/session_state" />
+                    <TextView android:id="@+id/session_state" style="@style/Widget.LanAtlas.Value"
+                        android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:text="@string/stopped" />
+                    <TextView style="@style/Widget.LanAtlas.Label"
+                        android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:layout_marginTop="12dp" android:text="@string/display_name" />
+                    <EditText android:id="@+id/name_input" style="@style/Widget.LanAtlas.Input"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:hint="@string/display_name" android:importantForAutofill="no"
+                        android:inputType="textPersonName"
+                        android:maxLines="1" android:text="@string/default_device_name" />
+                    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp" android:orientation="horizontal">
+                        <Button android:id="@+id/start_button" style="@style/Widget.LanAtlas.Button.Primary"
+                            android:layout_width="0dp" android:layout_height="wrap_content"
+                            android:layout_weight="1" android:text="@string/start_networking" />
+                        <Button android:id="@+id/stop_button" style="@style/Widget.LanAtlas.Button"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:layout_marginStart="8dp" android:text="@string/stop_networking" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp" android:baselineAligned="false" android:orientation="horizontal">
+                    <LinearLayout style="@style/Widget.LanAtlas.Card"
+                        android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1"
+                        android:orientation="vertical">
+                        <TextView style="@style/Widget.LanAtlas.Label" android:layout_width="wrap_content"
+                            android:layout_height="wrap_content" android:text="@string/nearby_sessions" />
+                        <TextView android:id="@+id/nearby_metric" style="@style/Widget.LanAtlas.Value"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:text="@string/zero_value" />
+                    </LinearLayout>
+                    <LinearLayout style="@style/Widget.LanAtlas.Card"
+                        android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1"
+                        android:layout_marginStart="8dp" android:orientation="vertical">
+                        <TextView style="@style/Widget.LanAtlas.Label" android:layout_width="wrap_content"
+                            android:layout_height="wrap_content" android:text="@string/discovery_listener" />
+                        <TextView android:id="@+id/discovery_metric" style="@style/Widget.LanAtlas.Value"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:text="@string/inactive" />
+                    </LinearLayout>
+                    <LinearLayout style="@style/Widget.LanAtlas.Card"
+                        android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1"
+                        android:layout_marginStart="8dp" android:orientation="vertical">
+                        <TextView style="@style/Widget.LanAtlas.Label" android:layout_width="wrap_content"
+                            android:layout_height="wrap_content" android:text="@string/echo_listener" />
+                        <TextView android:id="@+id/echo_metric" style="@style/Widget.LanAtlas.Value"
+                            android:layout_width="wrap_content" android:layout_height="wrap_content"
+                            android:text="@string/inactive" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp" android:background="@drawable/bg_warning"
+                    android:orientation="vertical">
+                    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:text="@string/security_summary" android:textColor="?attr/lanWarningText"
+                        android:textSize="15sp" android:textStyle="bold" />
+                    <TextView style="@style/Widget.LanAtlas.Subtitle"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp" android:text="@string/security_body" />
+                </LinearLayout>
+            </LinearLayout>
+        </ScrollView>
+
+        <LinearLayout
+            android:id="@+id/page_network"
+            android:layout_width="match_parent" android:layout_height="match_parent"
+            android:orientation="vertical" android:padding="16dp" android:visibility="gone">
+            <TextView style="@style/Widget.LanAtlas.Title"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="@string/observed_network" />
+            <TextView style="@style/Widget.LanAtlas.Subtitle"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginBottom="12dp" android:text="@string/network_subtitle" />
+            <org.lanmanager.prototype.ObservedTopologyView
+                android:id="@+id/topology_view"
+                android:layout_width="match_parent" android:layout_height="0dp"
+                android:layout_weight="1" android:background="@drawable/bg_card"
+                android:contentDescription="@string/observed_network"
+                android:importantForAccessibility="no" />
+        </LinearLayout>
+
+        <ScrollView
+            android:id="@+id/page_devices"
+            android:layout_width="match_parent" android:layout_height="match_parent"
+            android:fillViewport="true" android:visibility="gone">
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="vertical" android:padding="16dp">
+                <TextView style="@style/Widget.LanAtlas.Title"
+                    android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:text="@string/devices_title" />
+                <TextView style="@style/Widget.LanAtlas.Subtitle"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:layout_marginBottom="12dp" android:text="@string/devices_subtitle" />
+                <TextView android:id="@+id/empty_devices" style="@style/Widget.LanAtlas.Subtitle"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:gravity="center" android:padding="32dp" android:text="@string/waiting_devices" />
+                <LinearLayout android:id="@+id/device_list"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:orientation="vertical" />
+                <TextView android:id="@+id/device_limit_note" style="@style/Widget.LanAtlas.Subtitle"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:padding="12dp" android:visibility="gone" />
+            </LinearLayout>
+        </ScrollView>
+
+        <ScrollView
+            android:id="@+id/page_workbench"
+            android:layout_width="match_parent" android:layout_height="match_parent"
+            android:fillViewport="true" android:visibility="gone">
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="vertical" android:padding="16dp">
+                <TextView style="@style/Widget.LanAtlas.Title"
+                    android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:text="@string/workbench_title" />
+                <TextView style="@style/Widget.LanAtlas.Subtitle"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:layout_marginBottom="12dp" android:text="@string/workbench_subtitle" />
+                <LinearLayout style="@style/Widget.LanAtlas.Card"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:orientation="vertical">
+                    <TextView android:id="@+id/selected_target" style="@style/Widget.LanAtlas.Label"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:text="@string/no_selected_device" />
+                    <EditText android:id="@+id/host_input" style="@style/Widget.LanAtlas.Input"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:hint="@string/target_host" android:importantForAutofill="no"
+                        android:inputType="textUri"
+                        android:maxLines="1" />
+                    <Button android:id="@+id/probe_button" style="@style/Widget.LanAtlas.Button.Primary"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp" android:text="@string/probe_echo" />
+                </LinearLayout>
+                <LinearLayout style="@style/Widget.LanAtlas.Card"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp" android:orientation="vertical">
+                    <TextView style="@style/Widget.LanAtlas.Label"
+                        android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:text="@string/echo_result" />
+                    <TextView android:id="@+id/probe_status" style="@style/Widget.LanAtlas.Value"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp" android:text="@string/probe_idle" />
+                </LinearLayout>
+            </LinearLayout>
+        </ScrollView>
+
+        <ScrollView
+            android:id="@+id/page_more"
+            android:layout_width="match_parent" android:layout_height="match_parent"
+            android:fillViewport="true" android:visibility="gone">
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="vertical" android:padding="16dp">
+                <TextView style="@style/Widget.LanAtlas.Title"
+                    android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:text="@string/activity" />
+                <TextView style="@style/Widget.LanAtlas.Subtitle"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:layout_marginBottom="8dp" android:text="@string/activity_subtitle" />
+                <TextView android:id="@+id/log_view" style="@style/Widget.LanAtlas.Card"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:fontFamily="monospace" android:minHeight="180dp"
+                    android:textColor="?attr/lanPrimaryText" android:textIsSelectable="true"
+                    android:textSize="12sp" />
+                <TextView style="@style/Widget.LanAtlas.Title"
+                    android:layout_width="wrap_content" android:layout_height="wrap_content"
+                    android:layout_marginTop="24dp" android:text="@string/settings" />
+                <LinearLayout style="@style/Widget.LanAtlas.Card"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:orientation="vertical">
+                    <TextView style="@style/Widget.LanAtlas.Label"
+                        android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:text="@string/appearance" />
+                    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+                        <Button android:id="@+id/theme_dark" style="@style/Widget.LanAtlas.Button"
+                            android:layout_width="0dp" android:layout_height="wrap_content"
+                            android:layout_weight="1" android:text="@string/observatory_dark" />
+                        <Button android:id="@+id/theme_light" style="@style/Widget.LanAtlas.Button"
+                            android:layout_width="0dp" android:layout_height="wrap_content"
+                            android:layout_marginStart="8dp" android:layout_weight="1"
+                            android:text="@string/atlas_light" />
+                    </LinearLayout>
+                    <TextView style="@style/Widget.LanAtlas.Label"
+                        android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:layout_marginTop="16dp" android:text="@string/installation_id" />
+                    <TextView android:id="@+id/peer_id_view"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:fontFamily="monospace" android:textColor="?attr/lanPrimaryText"
+                        android:textIsSelectable="true" />
+                    <TextView style="@style/Widget.LanAtlas.Label"
+                        android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:layout_marginTop="12dp" android:text="@string/session_id" />
+                    <TextView android:id="@+id/session_id_view"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:fontFamily="monospace" android:text="@string/no_active_session"
+                        android:textColor="?attr/lanPrimaryText" android:textIsSelectable="true" />
+                    <TextView style="@style/Widget.LanAtlas.Subtitle"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="16dp" android:text="@string/protocol_ports" />
+                    <TextView style="@style/Widget.LanAtlas.Subtitle"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp" android:text="@string/lifecycle_explanation" />
+                </LinearLayout>
+            </LinearLayout>
+        </ScrollView>
+    </FrameLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:background="?attr/lanSurface" android:orientation="horizontal"
+        android:paddingStart="4dp" android:paddingTop="4dp" android:paddingEnd="4dp" android:paddingBottom="4dp">
+        <Button android:id="@+id/nav_overview" style="@style/Widget.LanAtlas.NavButton"
+            android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+            android:text="@string/overview" />
+        <Button android:id="@+id/nav_network" style="@style/Widget.LanAtlas.NavButton"
+            android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+            android:text="@string/network" />
+        <Button android:id="@+id/nav_devices" style="@style/Widget.LanAtlas.NavButton"
+            android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+            android:text="@string/devices" />
+        <Button android:id="@+id/nav_workbench" style="@style/Widget.LanAtlas.NavButton"
+            android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+            android:text="@string/workbench" />
+        <Button android:id="@+id/nav_more" style="@style/Widget.LanAtlas.NavButton"
+            android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+            android:text="@string/more" />
+    </LinearLayout>
+</LinearLayout>
