@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 import threading
@@ -65,7 +66,7 @@ class JsonLinesPostStore(PostStore):
 
     def add(self, post: dict[str, Any]) -> bool:
         """Validate, append, and fsync one post; duplicates report False."""
-        validated = validate_post(post)
+        validated = deepcopy(validate_post(post))
         with self._lock:
             if validated["post_id"] in self._posts:
                 return False
@@ -78,12 +79,13 @@ class JsonLinesPostStore(PostStore):
 
     def get(self, post_id: str) -> dict[str, Any] | None:
         with self._lock:
-            return self._posts.get(post_id)
+            post = self._posts.get(post_id)
+            return deepcopy(post) if post is not None else None
 
     def page(self, limit: int, cursor: dict[str, Any] | None = None,
              author_id: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any] | None, bool]:
         with self._lock:
-            ordered = sorted(self._posts.values(), key=sort_key)
+            ordered = deepcopy(sorted(self._posts.values(), key=sort_key))
         return page_posts(ordered, limit, cursor, author_id)
 
     def count(self) -> int:

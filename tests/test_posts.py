@@ -86,3 +86,14 @@ def test_repeated_sync_without_duplicates(tmp_path: Path) -> None:
     for item in page:
         assert second.add(item) is False
     assert second.count() == 1
+
+
+def test_store_isolates_mutable_post_values(tmp_path: Path) -> None:
+    store = JsonLinesPostStore(tmp_path / "posts.jsonl")
+    post = _post(refs=[{"kind": "post", "id": str(uuid4())}])
+    assert store.add(post)
+    post["text"] = "changed outside"
+    fetched = store.get(post["post_id"])
+    assert fetched is not None
+    fetched["text"] = "changed return"
+    assert store.get(post["post_id"])["text"] == "hello"
