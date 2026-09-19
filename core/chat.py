@@ -10,13 +10,18 @@ import socket
 import threading
 import time
 from typing import Any
+from uuid import uuid4
 
 from core.discovery import DiscoveryTransport, Hello, encode_hello
+from core.feed import merge_page, serve_query
 from core.protocol import (
     ProtocolError, envelope, recv_message, send_message, validate_envelope,
 )
 from core.roster import Peer, PeerRoster
+from core.storage import PostStore
 from core.transfer import TransferService
+
+MAX_SYNC_PAGES = 20
 
 
 class ChatService:
@@ -24,7 +29,8 @@ class ChatService:
 
     def __init__(self, hello: Hello, discovery_port: int = 50000,
                  broadcast: str = "255.255.255.255",
-                 reuse_address: bool = False) -> None:
+                 reuse_address: bool = False,
+                 post_store: PostStore | None = None) -> None:
         self.hello = hello
         encode_hello(hello)
         self.discovery_options = (hello.session_id, discovery_port,
@@ -37,6 +43,8 @@ class ChatService:
         self._active: set[socket.socket] = set()
         self._lock = threading.Lock()
         self._seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self.post_store = post_store
+        self._sync_cursors: dict[str, dict[str, Any] | None] = {}
         self.transfers = TransferService(hello, self._event)
 
     def start(self) -> None:
@@ -74,6 +82,33 @@ class ChatService:
             except Full:
                 self._event("status", f"Failed {message['message_id']} to "
                             f"{peer.hello.name}: outbound queue full")
+        return message["message_id"]
+
+    def publish_post(self, text: str, refs: list[dict[str, Any]] | None = None) -> str:
+        """Persist an immutable local post and notify the UI."""
+        if self.post_store is None:
+            raise RuntimeError("post store is not configured")
+        post = {"post_id": str(uuid4()), "author_id": self.hello.peer_id,
+                "text": text, "created_ms": time.time_ns() // 1_000_000,
+                "refs": refs or []}
+        if not self.post_store.add(post):
+            raise RuntimeError("generated duplicate post ID")
+        self._event("feed_updated", {"added": 1, "duplicates": 0})
+        return post["post_id"]
+
+    def sync_posts(self, peer: Peer) -> str:
+        """Queue a bounded page sync from one peer without blocking the UI."""
+        if self.post_store is None:
+            raise RuntimeError("post store is not configured")
+        if "posts_v1" not in peer.hello.capabilities:
+            raise ValueError("peer does not advertise posts_v1")
+        message = envelope("POST_QUERY", self.hello.peer_id, self.hello.session_id,
+                           {"cursor": self._sync_cursors.get(peer.hello.session_id),
+                            "limit": 50, "author_id": None})
+        try:
+            self._outgoing.put_nowait((peer, message))
+        except Full as error:
+            raise RuntimeError("outbound queue full") from error
         return message["message_id"]
 
     def stop(self) -> None:
@@ -182,8 +217,16 @@ class ChatService:
                             dedicated.close()
                             raise
                         continue
+                    if message["type"] == "POST_QUERY":
+                        if self.post_store is None:
+                            raise ProtocolError("post store is not configured")
+                        body = serve_query(self.post_store, message["body"])
+                        send_message(conn, envelope("POST_PAGE", self.hello.peer_id,
+                                                    self.hello.session_id, body,
+                                                    message["message_id"]))
+                        continue
                     if message["type"] != "CHAT":
-                        raise ProtocolError("chat listener accepts CHAT only")
+                        raise ProtocolError("listener does not accept this message type")
                     body = message["body"]
                     if body["scope"] == "dm" and body["to_session"] != self.hello.session_id:
                         raise ProtocolError("DM addressed to a different session")
@@ -199,8 +242,8 @@ class ChatService:
                                                 self.hello.session_id,
                                                 {"status": "accepted"},
                                                 message["message_id"]))
-            except (OSError, ProtocolError) as error:
-                self._event("status", f"Inbound chat ended: {error}")
+            except (OSError, ValueError) as error:
+                self._event("status", f"Inbound connection ended: {error}")
             finally:
                 self._track(conn, False)
 
@@ -219,6 +262,9 @@ class ChatService:
                 continue
             conn = None
             try:
+                if message["type"] == "POST_QUERY":
+                    self._sync_peer(peer, message)
+                    continue
                 conn = socket.create_connection((peer.ip, peer.hello.tcp_port), timeout=3)
                 self._track(conn, True)
                 with conn:
@@ -233,10 +279,51 @@ class ChatService:
                             or reply["body"].get("status") != "accepted"):
                         raise ProtocolError("invalid acknowledgement")
                 self._event("status", f"Accepted {message['message_id']} by {peer.hello.name}")
-            except (OSError, ProtocolError) as error:
+            except (OSError, ValueError) as error:
                 self._event("status", f"Failed {message['message_id']} to "
                             f"{peer.hello.name}: {error}")
             finally:
                 if conn is not None:
                     conn.close()
                     self._track(conn, False)
+
+    def _sync_peer(self, peer: Peer, query: dict[str, Any]) -> None:
+        """Fetch bounded pages, retaining a continuation cursor if capped."""
+        if self.post_store is None:
+            raise RuntimeError("post store is not configured")
+        added = duplicates = 0
+        current = query
+        for _ in range(MAX_SYNC_PAGES):
+            conn = socket.create_connection((peer.ip, peer.hello.tcp_port), timeout=3)
+            self._track(conn, True)
+            try:
+                with conn:
+                    send_message(conn, current)
+                    reply = recv_message(conn)
+            finally:
+                self._track(conn, False)
+            if reply is None:
+                raise ProtocolError("no post page response")
+            validate_envelope(reply)
+            if (reply["type"] != "POST_PAGE"
+                    or reply["reply_to"] != current["message_id"]
+                    or reply["peer_id"] != peer.hello.peer_id
+                    or reply["session_id"] != peer.hello.session_id):
+                raise ProtocolError("invalid post page response")
+            page_added, page_duplicates = merge_page(self.post_store,
+                                                      reply["body"]["posts"])
+            added += page_added
+            duplicates += page_duplicates
+            cursor = reply["body"]["next_cursor"]
+            if reply["body"]["complete"]:
+                self._sync_cursors.pop(peer.hello.session_id, None)
+                self._event("feed_updated", {"added": added,
+                                              "duplicates": duplicates})
+                return
+            self._sync_cursors[peer.hello.session_id] = cursor
+            current = envelope("POST_QUERY", self.hello.peer_id,
+                               self.hello.session_id,
+                               {"cursor": cursor, "limit": 50,
+                                "author_id": None})
+        self._event("feed_updated", {"added": added, "duplicates": duplicates,
+                                     "partial": True})

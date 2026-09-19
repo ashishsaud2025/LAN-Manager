@@ -124,7 +124,7 @@ def validate_envelope(message: dict[str, Any]) -> None:
     body = message.get("body")
     if not isinstance(body, dict):
         raise ProtocolError("body must be an object")
-    if message["type"] in {"ECHO_REPLY", "ACK", "ERROR"}:
+    if message["type"] in {"ECHO_REPLY", "ACK", "ERROR", "POST_PAGE"}:
         try:
             UUID(message.get("reply_to", ""))
         except (ValueError, TypeError, AttributeError) as error:

@@ -25,9 +25,9 @@ def test_query_and_page_envelopes_validate() -> None:
     query = _ids(peer, session, {"cursor": None, "limit": 10, "author_id": None}, "POST_QUERY")
     validate_envelope(query)
     post = _post()
-    page = _ids(peer, session, {"posts": [post], "next_cursor":
+    page = envelope("POST_PAGE", peer, session, {"posts": [post], "next_cursor":
         {"last_author": post["author_id"], "last_post": post["post_id"]},
-        "complete": True}, "POST_PAGE")
+        "complete": True}, query["message_id"])
     validate_envelope(page)
 
 
@@ -37,8 +37,8 @@ def test_bad_query_rejected() -> None:
         validate_envelope(_ids(peer, session, {"cursor": None, "limit": 0,
             "author_id": None}, "POST_QUERY"))
     with pytest.raises(ProtocolError):
-        validate_envelope(_ids(peer, session, {"cursor": None, "limit": 10,
-            "author_id": None}, "POST_PAGE"))
+        validate_envelope(envelope("POST_PAGE", peer, session,
+            {"cursor": None, "limit": 10, "author_id": None}, str(uuid4())))
 
 
 def test_serve_and_merge_roundtrip_with_reshare(tmp_path: Path) -> None:
@@ -77,5 +77,5 @@ def test_merge_rejects_bad_post(tmp_path: Path) -> None:
 def test_empty_page_must_be_complete() -> None:
     peer, session = str(uuid4()), str(uuid4())
     with pytest.raises(ProtocolError):
-        validate_envelope(_ids(peer, session, {"posts": [],
-            "next_cursor": None, "complete": False}, "POST_PAGE"))
+        validate_envelope(envelope("POST_PAGE", peer, session, {"posts": [],
+            "next_cursor": None, "complete": False}, str(uuid4())))

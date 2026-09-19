@@ -10,7 +10,7 @@ from PySide6.QtCore import QTimer, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QLineEdit, QMainWindow, QPushButton, QTextEdit,
-    QVBoxLayout, QWidget,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from core.chat import ChatService
@@ -24,11 +24,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.service = service
         self.peers: tuple[Peer, ...] = ()
+        self.feed_peers: tuple[Peer, ...] = ()
         self.transfer_rows: dict[str, dict[str, Any]] = {}
         self.setWindowTitle(f"LAN Manager: {service.hello.name}")
         self.resize(700, 450)
         container = QWidget(self)
         layout = QVBoxLayout(container)
+        tabs = QTabWidget()
+        chat_tab = QWidget()
+        chat_layout = QVBoxLayout(chat_tab)
         self.recipient = QComboBox()
         self.recipient.addItem("Room (all discovered chat peers)", None)
         self.log = QTextEdit()
@@ -46,7 +50,24 @@ class MainWindow(QMainWindow):
         for widget in (self.recipient, self.log, self.input, self.send_button,
                        self.file_button, self.transfer_list, self.accept_file,
                        self.decline_file, self.cancel_file):
-            layout.addWidget(widget)
+            chat_layout.addWidget(widget)
+        feed_tab = QWidget()
+        feed_layout = QVBoxLayout(feed_tab)
+        self.feed_peer = QComboBox()
+        self.feed_log = QTextEdit()
+        self.feed_log.setReadOnly(True)
+        self.feed_log.document().setMaximumBlockCount(500)
+        self.post_input = QLineEdit()
+        self.post_input.setMaxLength(4096)
+        self.post_input.setPlaceholderText("Publish a local post")
+        self.publish_button = QPushButton("Publish post")
+        self.sync_button = QPushButton("Sync selected peer")
+        for widget in (self.feed_peer, self.feed_log, self.post_input,
+                       self.publish_button, self.sync_button):
+            feed_layout.addWidget(widget)
+        tabs.addTab(chat_tab, "Chat and files")
+        tabs.addTab(feed_tab, "Feed")
+        layout.addWidget(tabs)
         self.setCentralWidget(container)
         self.send_button.clicked.connect(self.send)
         self.input.returnPressed.connect(self.send)
@@ -54,6 +75,10 @@ class MainWindow(QMainWindow):
         self.accept_file.clicked.connect(self.accept_offer)
         self.decline_file.clicked.connect(self.decline_offer)
         self.cancel_file.clicked.connect(self.cancel_transfer)
+        self.publish_button.clicked.connect(self.publish_post)
+        self.post_input.returnPressed.connect(self.publish_post)
+        self.sync_button.clicked.connect(self.sync_feed)
+        self.refresh_feed()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.drain)
         self.timer.start(50)
@@ -89,8 +114,11 @@ class MainWindow(QMainWindow):
                 break
             if kind == "roster":
                 selected = self.recipient.currentData()
+                feed_selected = self.feed_peer.currentData()
                 self.peers = tuple(peer for peer in value
                                    if "chat_v1" in peer.hello.capabilities)
+                self.feed_peers = tuple(peer for peer in value
+                                        if "posts_v1" in peer.hello.capabilities)
                 self.recipient.clear()
                 self.recipient.addItem("Room (all discovered chat peers)", None)
                 for peer in self.peers:
@@ -101,6 +129,12 @@ class MainWindow(QMainWindow):
                     self.recipient.addItem("Selected peer is unavailable", selected)
                     index = self.recipient.count() - 1
                 self.recipient.setCurrentIndex(max(0, index))
+                self.feed_peer.clear()
+                for peer in self.feed_peers:
+                    self.feed_peer.addItem(f"{peer.hello.name} ({peer.ip})",
+                                           peer.hello.session_id)
+                feed_index = self.feed_peer.findData(feed_selected)
+                self.feed_peer.setCurrentIndex(max(0, feed_index))
             elif kind == "message":
                 self.append(f"{value['body']['scope']} from {value['peer_id']}: "
                             f"{value['body']['text']}")
@@ -110,8 +144,50 @@ class MainWindow(QMainWindow):
                     self.append(f"File offer: {value['name']!r}, {value['size']} bytes "
                                 f"from {value['peer_id']}. Select it below to accept or decline.")
                 self.update_transfer(value)
+            elif kind == "feed_updated":
+                suffix = " (more pages available)" if value.get("partial") else ""
+                self.append(f"Feed sync: {value['added']} added, "
+                            f"{value['duplicates']} duplicates{suffix}")
+                self.refresh_feed()
             else:
                 self.append(str(value))
+
+    @Slot()
+    def publish_post(self) -> None:
+        """Persist a local text post without doing network I/O on the Qt thread."""
+        try:
+            identifier = self.service.publish_post(self.post_input.text())
+        except (ValueError, RuntimeError, OSError) as error:
+            self.append(str(error))
+            return
+        self.post_input.clear()
+        self.append(f"Published post {identifier}")
+        self.refresh_feed()
+
+    @Slot()
+    def sync_feed(self) -> None:
+        """Queue feed paging from the explicitly selected capable peer."""
+        selected = self.feed_peer.currentData()
+        peer = next((item for item in self.feed_peers
+                     if item.hello.session_id == selected), None)
+        if peer is None:
+            self.append("Select one feed peer before syncing.")
+            return
+        try:
+            identifier = self.service.sync_posts(peer)
+        except (ValueError, RuntimeError) as error:
+            self.append(str(error))
+            return
+        self.append(f"Feed sync queued {identifier}")
+
+    def refresh_feed(self) -> None:
+        """Render a bounded local feed snapshot as plain text."""
+        if self.service.post_store is None:
+            self.feed_log.setPlainText("Post storage is not configured.")
+            return
+        posts, _, _ = self.service.post_store.page(50)
+        lines = [f"{post['author_id']} | {post['text']}" for post in posts]
+        self.feed_log.setPlainText("\n\n".join(lines) if lines else "No cached posts.")
 
     def update_transfer(self, value: dict[str, Any]) -> None:
         """Display bounded transfer history with explicit progress semantics."""

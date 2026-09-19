@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication
 
 from core.chat import ChatService
 from core.discovery import Hello
+from core.storage import JsonLinesPostStore
 from gui.main_window import MainWindow
 from m1_discovery import load_identity, port_number
 
@@ -28,12 +29,14 @@ def main() -> int:
     parser.add_argument("--broadcast", default="255.255.255.255")
     parser.add_argument("--reuse-address", action="store_true")
     parser.add_argument("--identity-file", type=Path, default=root / "lan-manager/peer-id")
+    parser.add_argument("--post-file", type=Path, default=root / "lan-manager/posts.jsonl")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     try:
         hello = Hello(load_identity(args.identity_file), str(uuid4()), args.name,
-                      args.tcp_port, ("chat_v1", "file_v1"))
-        service = ChatService(hello, args.port, args.broadcast, args.reuse_address)
+                      args.tcp_port, ("chat_v1", "file_v1", "posts_v1"))
+        service = ChatService(hello, args.port, args.broadcast, args.reuse_address,
+                              JsonLinesPostStore(args.post_file))
     except (ValueError, OSError) as error:
         logging.error("Startup failed: %s", error)
         return 1
