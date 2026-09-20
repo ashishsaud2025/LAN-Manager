@@ -28,6 +28,7 @@ from core.roster import Peer
 CHUNK_SIZE = 64 * 1024
 MAX_TRANSFERS = 4
 OFFER_TIMEOUT = 60.0
+VERIFY_TIMEOUT = 300.0
 
 
 class TransferError(ProtocolError):
@@ -255,7 +256,7 @@ class TransferService:
             self._write(transfer, "FILE_DONE")
             self._status(transfer, "awaiting_verification", bytes=offset, total=size)
             reply = self._read(transfer, peer.hello.peer_id, peer.hello.session_id,
-                               OFFER_TIMEOUT)
+                               VERIFY_TIMEOUT)
             if (reply["type"] != "FILE_RESULT" or reply["body"].get("sha256") != digest
                     or reply["body"].get("size") != size
                     or reply["body"].get("status") != "verified"):

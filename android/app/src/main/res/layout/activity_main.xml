@@ -232,6 +232,36 @@
                         android:layout_width="match_parent" android:layout_height="wrap_content"
                         android:layout_marginTop="6dp" android:text="@string/probe_idle" />
                 </LinearLayout>
+                <LinearLayout style="@style/Widget.LanAtlas.Card"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp" android:orientation="vertical">
+                    <TextView style="@style/Widget.LanAtlas.Label"
+                        android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:text="@string/file_transfer" />
+                    <TextView android:id="@+id/transfer_status" style="@style/Widget.LanAtlas.Subtitle"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp" android:text="@string/transfer_idle" />
+                    <ProgressBar android:id="@+id/transfer_progress"
+                        style="?android:attr/progressBarStyleHorizontal"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp" android:max="100" android:progress="0" />
+                    <Button android:id="@+id/send_file_button" style="@style/Widget.LanAtlas.Button.Primary"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp" android:enabled="false"
+                        android:text="@string/choose_file" />
+                    <Button android:id="@+id/accept_file_button" style="@style/Widget.LanAtlas.Button.Primary"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp" android:enabled="false"
+                        android:text="@string/accept_file" />
+                    <Button android:id="@+id/decline_file_button" style="@style/Widget.LanAtlas.Button"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp" android:enabled="false"
+                        android:text="@string/decline_file" />
+                    <Button android:id="@+id/cancel_transfer_button" style="@style/Widget.LanAtlas.Button"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp" android:enabled="false"
+                        android:text="@string/cancel_transfer" />
+                </LinearLayout>
             </LinearLayout>
         </ScrollView>
 
@@ -288,6 +318,9 @@
                     <TextView style="@style/Widget.LanAtlas.Subtitle"
                         android:layout_width="match_parent" android:layout_height="wrap_content"
                         android:layout_marginTop="16dp" android:text="@string/protocol_ports" />
+                    <TextView style="@style/Widget.LanAtlas.Subtitle"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp" android:text="@string/prototype_scope" />
                     <TextView style="@style/Widget.LanAtlas.Subtitle"
                         android:layout_width="match_parent" android:layout_height="wrap_content"
                         android:layout_marginTop="8dp" android:text="@string/lifecycle_explanation" />
