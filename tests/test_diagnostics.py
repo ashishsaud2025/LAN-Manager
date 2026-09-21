@@ -4,6 +4,7 @@ from queue import Queue
 import socket
 import threading
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -11,6 +12,7 @@ from core.diagnostics import (
     DiagnosticsService, NeighborSnapshot, ProbeResult, parse_linux_neighbors,
     parse_windows_neighbors,
 )
+from core.protocol import envelope, recv_message, send_message, validate_envelope
 
 
 def _events() -> tuple[Queue[tuple[str, Any]], Any]:
@@ -127,6 +129,46 @@ def test_tcp_check_reports_success_without_sending_data() -> None:
     assert received == b""
 
 
+@pytest.mark.parametrize("matching_identity", [True, False])
+def test_echo_requires_correlation_body_and_advertised_identity(
+        matching_identity: bool) -> None:
+    events, emit = _events()
+    remote_peer_id, remote_session_id = str(uuid4()), str(uuid4())
+    expected_session_id = remote_session_id if matching_identity else str(uuid4())
+    errors: list[Exception] = []
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(2)
+
+        def respond() -> None:
+            try:
+                conn, _ = listener.accept()
+                with conn:
+                    request = recv_message(conn)
+                    validate_envelope(request)
+                    send_message(conn, envelope(
+                        "ECHO_REPLY", remote_peer_id, remote_session_id,
+                        request["body"], request["message_id"]))
+            except Exception as error:
+                errors.append(error)
+
+        server = threading.Thread(target=respond, daemon=True)
+        server.start()
+        service = DiagnosticsService(emit)
+        service.start()
+        service.echo("127.0.0.1", listener.getsockname()[1],
+                     remote_peer_id, expected_session_id)
+        assert events.get(timeout=2)[0] == "diagnostic_started"
+        kind, result = events.get(timeout=2)
+        service.stop()
+        assert service.join(2)
+        server.join(2)
+    assert not errors
+    assert kind == "diagnostic_result"
+    assert result.state == ("compatible" if matching_identity else "incompatible")
+
+
 def test_validation_and_queue_bounds_reject_unsafe_requests() -> None:
     _, emit = _events()
     service = DiagnosticsService(emit)
@@ -134,6 +176,8 @@ def test_validation_and_queue_bounds_reject_unsafe_requests() -> None:
         service.ping("example.com")
     with pytest.raises(ValueError, match="port"):
         service.tcp_connect("127.0.0.1", 0)
+    with pytest.raises(ValueError, match="peer ID"):
+        service.echo("127.0.0.1", 50002, "not-a-uuid", str(uuid4()))
     for _ in range(16):
         service.ping("127.0.0.1")
     with pytest.raises(RuntimeError, match="queue is full"):

@@ -16,7 +16,11 @@ import sys
 import threading
 import time
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
+
+from core.protocol import (
+    ProtocolError, envelope, recv_message, send_message, validate_envelope,
+)
 
 MAX_NEIGHBORS = 256
 MAX_COMMAND_OUTPUT = 262_144
@@ -24,6 +28,7 @@ REQUEST_QUEUE_SIZE = 16
 INVENTORY_TIMEOUT = 4.0
 PING_TIMEOUT = 3.0
 TCP_TIMEOUT = 3.0
+ECHO_TIMEOUT = 5.0
 _MAC_PATTERN = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
 _WINDOWS_NEIGHBOR_STATES = {
     0: "unreachable", 1: "incomplete", 2: "probe", 3: "delay",
@@ -74,6 +79,8 @@ class _Request:
     request_id: str
     address: str = ""
     port: int | None = None
+    peer_id: str | None = None
+    session_id: str | None = None
 
 
 CommandRunner = Callable[[list[str], float], tuple[int, str, str]]
@@ -162,9 +169,12 @@ def _deduplicate(values: Any) -> tuple[Neighbor, ...]:
 class DiagnosticsService:
     """Run neighbor refreshes and selected probes on one cancellable worker."""
 
-    def __init__(self, event_sink: EventSink, platform: str | None = None,
+    def __init__(self, event_sink: EventSink, peer_id: str | None = None,
+                 session_id: str | None = None, platform: str | None = None,
                  command_runner: CommandRunner | None = None) -> None:
         self._event = event_sink
+        self._peer_id = peer_id or str(uuid4())
+        self._session_id = session_id or str(uuid4())
         self._platform = platform or sys.platform
         self._command_runner = command_runner or self._run_command
         self._requests: Queue[_Request | None] = Queue(maxsize=REQUEST_QUEUE_SIZE)
@@ -198,6 +208,17 @@ class DiagnosticsService:
         if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
             raise ValueError("TCP port must be between 1 and 65535")
         return self._queue(_Request("tcp", str(uuid4()), target, port))
+
+    def echo(self, address: str, port: int, peer_id: str,
+             session_id: str) -> str:
+        """Queue one correlated LAN Manager ECHO exchange."""
+        target = _validate_address(address)
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise ValueError("ECHO port must be between 1 and 65535")
+        return self._queue(_Request(
+            "echo", str(uuid4()), target, port,
+            _validate_uuid(peer_id, "peer ID"),
+            _validate_uuid(session_id, "session ID")))
 
     def cancel(self) -> None:
         """Cancel the operation currently running without stopping the worker."""
@@ -253,8 +274,10 @@ class DiagnosticsService:
                 self._refresh(request)
             elif request.kind == "ping":
                 self._ping(request)
-            else:
+            elif request.kind == "tcp":
                 self._tcp_connect(request)
+            else:
+                self._echo(request)
 
     def _refresh(self, request: _Request) -> None:
         source = "OS neighbor cache"
@@ -342,6 +365,59 @@ class DiagnosticsService:
         return ProbeResult(request.request_id, "tcp", request.address, request.port,
                            state, (time.monotonic() - started) * 1000, str(error))
 
+    def _echo(self, request: _Request) -> None:
+        self._event("diagnostic_started", ProbeResult(
+            request.request_id, "echo", request.address, request.port, "running"))
+        started = time.monotonic()
+        active_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        active_socket.settimeout(TCP_TIMEOUT)
+        with self._lock:
+            self._socket = active_socket
+        try:
+            active_socket.connect((request.address, request.port))
+            body = {"text": f"lan-atlas:{request.request_id}"}
+            message = envelope(
+                "ECHO", self._peer_id, self._session_id, body)
+            send_message(active_socket, message, ECHO_TIMEOUT)
+            reply = recv_message(active_socket, ECHO_TIMEOUT)
+            if reply is None:
+                raise ProtocolError("ECHO endpoint closed without a reply")
+            validate_envelope(reply)
+            if (reply["type"] != "ECHO_REPLY"
+                    or reply["reply_to"] != message["message_id"]
+                    or reply["body"] != body
+                    or reply["peer_id"] != request.peer_id
+                    or reply["session_id"] != request.session_id):
+                raise ProtocolError("ECHO reply correlation or identity mismatch")
+            result = ProbeResult(
+                request.request_id, "echo", request.address, request.port,
+                "cancelled" if self._cancelled() else "compatible",
+                (time.monotonic() - started) * 1000,
+                "Correlated LAN Manager ECHO_REPLY matched the advertised session")
+        except ProtocolError as error:
+            result = self._echo_failure(request, started, "incompatible", error)
+        except ConnectionRefusedError as error:
+            result = self._echo_failure(request, started, "refused", error)
+        except (TimeoutError, socket.timeout) as error:
+            result = self._echo_failure(request, started, "timed_out", error)
+        except OSError as error:
+            state = ("network_unreachable" if error.errno in {
+                errno.ENETUNREACH, errno.EHOSTUNREACH} else "failed")
+            result = self._echo_failure(request, started, state, error)
+        finally:
+            active_socket.close()
+            with self._lock:
+                if self._socket is active_socket:
+                    self._socket = None
+        self._event("diagnostic_result", result)
+
+    def _echo_failure(self, request: _Request, started: float, state: str,
+                      error: Exception) -> ProbeResult:
+        if self._cancelled():
+            state = "cancelled"
+        return ProbeResult(request.request_id, "echo", request.address, request.port,
+                           state, (time.monotonic() - started) * 1000, str(error))
+
     def _run_command(self, command: list[str], timeout: float) -> tuple[int, str, str]:
         try:
             process = subprocess.Popen(
@@ -382,6 +458,15 @@ def _validate_address(value: str) -> str:
     if not isinstance(parsed, IPv4Address) or parsed.is_multicast or parsed.is_unspecified:
         raise ValueError("enter a unicast IPv4 address")
     return str(parsed)
+
+
+def _validate_uuid(value: str, label: str) -> str:
+    try:
+        if not isinstance(value, str) or str(UUID(value)) != value:
+            raise ValueError("noncanonical UUID")
+    except ValueError as error:
+        raise ValueError(f"{label} must be a canonical UUID") from error
+    return value
 
 
 def _detail(value: str) -> str:
