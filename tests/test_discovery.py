@@ -8,6 +8,7 @@ import pytest
 
 from core.discovery import (
     HEADER, DiscoveryError, DiscoveryTransport, Hello, decode_hello, encode_hello,
+    local_ipv4_addresses,
 )
 from m1_discovery import load_identity, run
 
@@ -55,7 +56,7 @@ def test_bad_fields(key: str, value: object) -> None:
 def test_transport_filtering_and_recovery() -> None:
     receiver, sender = Mock(), Mock()
     with patch("core.discovery.socket.socket", side_effect=[receiver, sender]):
-        transport = DiscoveryTransport(SESSION)
+        transport = DiscoveryTransport(SESSION, source_addresses=())
         own = GOLDEN
         other = encode_hello(Hello(PEER, PEER, "Other"))
         receiver.recvfrom.side_effect = [(own, ("192.0.2.1", 1234)),
@@ -69,7 +70,37 @@ def test_transport_filtering_and_recovery() -> None:
         receiver.bind.assert_called_once_with(("0.0.0.0", 50000))
         transport.close()
         receiver.close.assert_called_once()
-        sender.close.assert_called_once()
+    sender.close.assert_called_once()
+
+
+def test_local_ipv4_candidates_exclude_loopback_and_link_local() -> None:
+    records = [
+        (2, 2, 0, "", ("127.0.0.1", 0)),
+        (2, 2, 0, "", ("169.254.10.2", 0)),
+        (2, 2, 0, "", ("192.168.56.1", 0)),
+        (2, 2, 0, "", ("192.168.1.65", 0)),
+        (2, 2, 0, "", ("192.168.1.65", 0)),
+    ]
+    with patch("core.discovery.socket.gethostname", return_value="desktop"), \
+            patch("core.discovery.socket.getaddrinfo", return_value=records):
+        assert local_ipv4_addresses() == ("192.168.1.65", "192.168.56.1")
+
+
+def test_announcement_uses_each_bound_interface_and_tolerates_one_failure() -> None:
+    receiver, fallback, virtual, wifi = Mock(), Mock(), Mock(), Mock()
+    fallback.sendto.side_effect = OSError("wrong interface")
+    with patch("core.discovery.socket.socket",
+               side_effect=[receiver, fallback, virtual, wifi]):
+        transport = DiscoveryTransport(
+            SESSION, source_addresses=("192.168.56.1", "192.168.1.65"))
+    transport.announce(Hello(PEER, SESSION, "Alice"))
+    virtual.bind.assert_called_once_with(("192.168.56.1", 0))
+    wifi.bind.assert_called_once_with(("192.168.1.65", 0))
+    for sender in (fallback, virtual, wifi):
+        sender.sendto.assert_called_once_with(GOLDEN, ("255.255.255.255", 50000))
+    transport.close()
+    for sock in (receiver, fallback, virtual, wifi):
+        sock.close.assert_called_once()
 
 
 def test_cleanup_after_bind_failure() -> None:

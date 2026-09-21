@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from ipaddress import IPv4Address, ip_address
 import socket
 from dataclasses import dataclass
 from uuid import UUID
@@ -96,31 +97,84 @@ def decode_hello(packet: bytes) -> Hello:
     return hello
 
 
+def local_ipv4_addresses() -> tuple[str, ...]:
+    """Return bounded interface candidates suitable for IPv4 LAN broadcast."""
+    try:
+        records = socket.getaddrinfo(
+            socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as error:
+        logger.warning("Could not enumerate local IPv4 addresses: %s", error)
+        return ()
+    addresses: set[str] = set()
+    for record in records[:64]:
+        value = record[4][0]
+        try:
+            address = ip_address(value)
+        except ValueError:
+            continue
+        if (isinstance(address, IPv4Address) and not address.is_loopback
+                and not address.is_link_local and not address.is_multicast
+                and not address.is_unspecified):
+            addresses.add(str(address))
+    return tuple(sorted(addresses, key=lambda item: tuple(
+        int(part) for part in item.split("."))))
+
+
 class DiscoveryTransport:
     """Own a receiving socket and a separate broadcast sending socket."""
 
     def __init__(self, session_id: str, port: int = DISCOVERY_PORT,
                  destination: str = BROADCAST_ADDRESS,
-                 reuse_address: bool = False) -> None:
+                 reuse_address: bool = False,
+                 source_addresses: tuple[str, ...] | None = None) -> None:
         self.session_id = session_id
         self.destination = (destination, port)
         self.receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sender: socket.socket | None = None
+        self.senders: list[socket.socket] = []
         try:
             if reuse_address:
                 self.receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.receiver.bind((BIND_ADDRESS, port))
-            self.sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sender.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self.senders.append(self._sender())
+            candidates = (local_ipv4_addresses()
+                          if source_addresses is None else source_addresses)
+            for address in candidates[:16]:
+                sender = self._sender()
+                try:
+                    sender.bind((address, 0))
+                except OSError as error:
+                    sender.close()
+                    logger.warning("Could not bind discovery sender to %s: %s",
+                                   address, error)
+                    continue
+                self.senders.append(sender)
         except OSError:
             self.close()
             raise
 
+    @staticmethod
+    def _sender() -> socket.socket:
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        return sender
+
     def announce(self, hello: Hello) -> None:
         """Send one HELLO; propagate failures to the runner."""
-        if self.sender is None:
+        if not self.senders:
             raise OSError("transport is closed")
-        self.sender.sendto(encode_hello(hello), self.destination)
+        packet = encode_hello(hello)
+        errors: list[OSError] = []
+        delivered = 0
+        for sender in self.senders:
+            try:
+                sender.sendto(packet, self.destination)
+                delivered += 1
+            except OSError as error:
+                errors.append(error)
+        if delivered == 0:
+            raise errors[-1] if errors else OSError("transport is closed")
+        for error in errors:
+            logger.warning("Discovery announcement failed on one interface: %s", error)
 
     def receive(self) -> tuple[Hello, tuple[str, int]] | None:
         """Read one datagram, returning other sessions and their observed source."""
@@ -136,8 +190,8 @@ class DiscoveryTransport:
         return hello, address
 
     def close(self) -> None:
-        """Release both sockets, including after partial initialization."""
+        """Release all sockets, including after partial initialization."""
         self.receiver.close()
-        if self.sender is not None:
-            self.sender.close()
-            self.sender = None
+        for sender in self.senders:
+            sender.close()
+        self.senders.clear()
