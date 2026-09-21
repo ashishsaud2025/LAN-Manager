@@ -1,4 +1,4 @@
-"""Stable Qt models for the LAN Atlas Phase 1 pages."""
+"""Stable Qt presentation models backed by canonical LAN Atlas state."""
 
 from __future__ import annotations
 
@@ -7,9 +7,9 @@ from datetime import datetime
 import time
 from typing import Any
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt
+from PySide6.QtCore import QAbstractListModel, QAbstractTableModel, QModelIndex, Qt
 
-from core.roster import Peer
+from core.peer_repository import PeerRecord
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,9 @@ class AdminDevice:
     source: str
     detail: str
     port: int | None = None
+    capabilities: tuple[str, ...] = ()
+    peer_id: str | None = None
+    session_id: str | None = None
 
 
 class AdminDeviceListModel(QAbstractListModel):
@@ -95,20 +98,21 @@ class PeerListModel(QAbstractListModel):
 
     def __init__(self) -> None:
         super().__init__()
-        self.peers: tuple[Peer, ...] = ()
+        self.records: tuple[PeerRecord, ...] = ()
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        return 0 if parent.isValid() else len(self.peers)
+        return 0 if parent.isValid() else len(self.records)
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
-        if not index.isValid() or not 0 <= index.row() < len(self.peers):
+        if not index.isValid() or not 0 <= index.row() < len(self.records):
             return None
-        peer = self.peers[index.row()]
+        peer = self.records[index.row()]
         if role == Qt.ItemDataRole.DisplayRole:
             capabilities = " · ".join(capability_label(item)
                                       for item in peer.hello.capabilities) or "Presence only"
             age = max(0.0, time.monotonic() - peer.last_seen)
-            return (f"{peer.hello.name} · seen {age:.1f}s ago\n"
+            state = "Nearby" if peer.nearby else "Offline / stale"
+            return (f"{peer.hello.name} · {state} · seen {age:.1f}s ago\n"
                     f"{peer.ip}:{peer.hello.tcp_port}  ·  {capabilities}\n"
                     f"Unverified session {peer.hello.session_id[:8]}…")
         if role == self.PeerRole:
@@ -118,22 +122,97 @@ class PeerListModel(QAbstractListModel):
                     "Identity is self-reported and not authenticated.")
         if role == Qt.ItemDataRole.AccessibleTextRole:
             return (f"{peer.hello.name}, endpoint {peer.ip}:{peer.hello.tcp_port}, "
+                    f"{'nearby' if peer.nearby else 'offline or stale'}, "
                     "unverified identity")
         return None
 
-    def set_peers(self, peers: tuple[Peer, ...]) -> None:
-        """Replace a complete discovery snapshot atomically."""
+    def set_records(self, records: tuple[PeerRecord, ...]) -> None:
+        """Replace one complete canonical repository snapshot atomically."""
         self.beginResetModel()
-        self.peers = peers
+        self.records = records
         self.endResetModel()
 
-    def peer_at(self, row: int) -> Peer | None:
-        return self.peers[row] if 0 <= row < len(self.peers) else None
+    def record_at(self, row: int) -> PeerRecord | None:
+        """Return one repository record by row."""
+        return self.records[row] if 0 <= row < len(self.records) else None
 
     def refresh_ages(self) -> None:
         """Refresh derived last-seen labels without resetting selection."""
-        if self.peers:
-            self.dataChanged.emit(self.index(0, 0), self.index(len(self.peers) - 1, 0))
+        if self.records:
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self.records) - 1, 0))
+
+
+class PeerTableModel(QAbstractTableModel):
+    """Dense evidence-only session table for Devices and Overview."""
+
+    PeerRole = Qt.ItemDataRole.UserRole + 1
+    HEADERS = ("SESSION", "OBSERVED ENDPOINT", "LAST HELLO", "CAPABILITIES")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: tuple[PeerRecord, ...] = ()
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.records)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def headerData(self, section: int, orientation: Qt.Orientation,
+                   role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if (role == Qt.ItemDataRole.DisplayRole
+                and orientation == Qt.Orientation.Horizontal
+                and 0 <= section < len(self.HEADERS)):
+            return self.HEADERS[section]
+        return None
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if not index.isValid() or not 0 <= index.row() < len(self.records):
+            return None
+        peer = self.records[index.row()]
+        if role == self.PeerRole:
+            return peer
+        if role == Qt.ItemDataRole.DisplayRole:
+            age = max(0.0, time.monotonic() - peer.last_seen)
+            values = (
+                (f"{peer.hello.name}\n"
+                 f"{'Nearby' if peer.nearby else 'Offline / stale'} · "
+                 f"Unverified · {peer.hello.session_id[:8]}…"),
+                f"{peer.ip}:{peer.hello.tcp_port}",
+                f"{age:.1f} s ago\n{'Nearby' if peer.nearby else 'Stale'}",
+                "  ·  ".join(capability_label(item)
+                              for item in peer.hello.capabilities) or "Presence only",
+            )
+            return values[index.column()]
+        if role == Qt.ItemDataRole.AccessibleTextRole:
+            age = max(0.0, time.monotonic() - peer.last_seen)
+            values = (
+                f"Session {peer.hello.name}, unverified, identifier "
+                f"{peer.hello.session_id}",
+                f"Observed endpoint {peer.ip}:{peer.hello.tcp_port}",
+                f"Last HELLO {age:.1f} seconds ago, "
+                f"{'nearby' if peer.nearby else 'offline or stale'}",
+                "Capabilities " + (", ".join(
+                    capability_label(item) for item in peer.hello.capabilities)
+                    or "presence only"),
+            )
+            return values[index.column()]
+        return None
+
+    def set_records(self, records: tuple[PeerRecord, ...]) -> None:
+        """Replace one complete canonical repository snapshot."""
+        self.beginResetModel()
+        self.records = records
+        self.endResetModel()
+
+    def record_at(self, row: int) -> PeerRecord | None:
+        """Return one canonical peer record by table row."""
+        return self.records[row] if 0 <= row < len(self.records) else None
+
+    def refresh_ages(self) -> None:
+        """Refresh last-HELLO cells without disturbing selection."""
+        if self.records:
+            self.dataChanged.emit(self.index(0, 2), self.index(len(self.records) - 1, 2))
 
 
 class MessageListModel(QAbstractListModel):

@@ -15,6 +15,7 @@ from uuid import uuid4
 from core.discovery import DiscoveryTransport, Hello, encode_hello
 from core.diagnostics import DiagnosticsService
 from core.feed import merge_page, serve_query
+from core.peer_repository import PeerRepository, PeerRepositoryEvent
 from core.protocol import (
     ProtocolError, envelope, recv_message, send_message, validate_envelope,
 )
@@ -44,10 +45,12 @@ class ChatService:
         self._active: set[socket.socket] = set()
         self._lock = threading.Lock()
         self._seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self.peer_repository = PeerRepository()
         self.post_store = post_store
         self._sync_cursors: dict[str, dict[str, Any] | None] = {}
         self.transfers = TransferService(hello, self._event)
-        self.diagnostics = DiagnosticsService(self._event)
+        self.diagnostics = DiagnosticsService(
+            self._event, hello.peer_id, hello.session_id)
 
     def start(self) -> None:
         """Start a single service lifecycle; networking initialization is asynchronous."""
@@ -154,7 +157,7 @@ class ChatService:
         try:
             transport = DiscoveryTransport(*self.discovery_options)
             due = time.monotonic()
-            published = ()
+            pending: PeerRepositoryEvent | None = None
             while not self._stop.is_set():
                 now = time.monotonic()
                 roster.expire(now)
@@ -171,9 +174,11 @@ class ChatService:
                         hello, address = result
                         roster.update(hello, address[0], time.monotonic())
                 peers = roster.snapshot()
-                visible = peers
-                if visible != published and self._event("roster", peers):
-                    published = visible
+                event = self.peer_repository.reconcile_presence(peers, now)
+                if event is not None:
+                    pending = event
+                if pending is not None and self._event("peer_repository", pending):
+                    pending = None
         except OSError as error:
             self._event("status", f"Discovery stopped: {error}")
         finally:

@@ -5,10 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFrame, QLabel, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget,
 )
+
+from gui.theme import GEOMETRY, SPACING
 
 
 class NavigationRail(QFrame):
@@ -19,19 +22,22 @@ class NavigationRail(QFrame):
     def __init__(self, groups: tuple[tuple[str, tuple[tuple[str, int | None], ...]], ...]) -> None:
         super().__init__()
         self.setObjectName("Navigation")
-        self.setFixedWidth(184)
+        self.setFixedWidth(GEOMETRY["navigation"])
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 20, 16, 16)
-        brand = QLabel("LAN ATLAS")
-        brand.setObjectName("Brand")
-        subtitle = QLabel("your local network workspace")
-        subtitle.setObjectName("BrandSubtle")
-        layout.addWidget(brand)
-        layout.addWidget(subtitle)
-        layout.addSpacing(18)
+        layout.setContentsMargins(SPACING["lg"], SPACING["lg"],
+                                  SPACING["lg"], SPACING["lg"])
+        self.brand = QLabel("LAN ATLAS")
+        self.brand.setObjectName("Brand")
+        self.subtitle = QLabel("your local network workspace")
+        self.subtitle.setObjectName("BrandSubtle")
+        self.subtitle.setWordWrap(True)
+        layout.addWidget(self.brand)
+        layout.addWidget(self.subtitle)
+        layout.addSpacing(SPACING["lg"])
         self.list = QListWidget()
         self.list.setObjectName("NavigationList")
         self.list.setAccessibleName("Primary navigation")
+        self.list.setIconSize(QSize(18, 18))
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.page_items: dict[int, QListWidgetItem] = {}
         for group, pages in groups:
@@ -44,12 +50,20 @@ class NavigationRail(QFrame):
                     continue
                 label = page
                 item = QListWidgetItem(label)
+                item.setIcon(_navigation_icon(page))
                 item.setData(256, index)
                 self.page_items[index] = item
                 self.list.addItem(item)
         self.list.currentItemChanged.connect(self._emit_page)
         self.list.setCurrentItem(self.page_items[0])
         layout.addWidget(self.list, 1)
+
+    def set_compact(self, compact: bool) -> None:
+        """Adjust rail density without changing its navigation structure."""
+        width = (GEOMETRY["navigation_compact"] if compact
+                 else GEOMETRY["navigation"])
+        self.setFixedWidth(width)
+        self.subtitle.setVisible(not compact)
 
     def select(self, index: int) -> None:
         """Select a page from keyboard shortcuts or contextual actions."""
@@ -102,3 +116,65 @@ def action_button(text: str, callback: Callable[[], None],
     button.setProperty("primary", primary)
     button.clicked.connect(callback)
     return button
+
+
+def _navigation_icon(page: str) -> QIcon:
+    """Draw restrained monochrome navigation glyphs without icon-font dependencies."""
+    pixmap = QPixmap(36, 36)
+    pixmap.setDevicePixelRatio(2.0)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.scale(2.0, 2.0)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(QColor("#9FB7C1"), 1.5))
+    if page == "Overview":
+        for x, y in ((2, 2), (10, 2), (2, 10), (10, 10)):
+            painter.drawRect(x, y, 5, 5)
+    elif page == "Network":
+        painter.drawLine(4, 5, 9, 9)
+        painter.drawLine(14, 4, 9, 9)
+        painter.drawLine(9, 9, 5, 14)
+        for point in (QPoint(4, 4), QPoint(14, 3), QPoint(9, 9), QPoint(5, 14)):
+            painter.drawEllipse(point, 2, 2)
+    elif page in {"Devices", "Workbench"}:
+        painter.drawRoundedRect(QRect(2, 3, 14, 10), 1, 1)
+        painter.drawLine(6, 16, 12, 16)
+        painter.drawLine(9, 13, 9, 16)
+        if page == "Workbench":
+            painter.drawLine(5, 6, 13, 11)
+    elif page == "Files":
+        painter.drawRect(2, 5, 14, 10)
+        painter.drawLine(2, 5, 7, 5)
+        painter.drawLine(4, 3, 8, 3)
+    elif page == "Transfers":
+        painter.drawLine(2, 6, 14, 6)
+        painter.drawLine(11, 3, 14, 6)
+        painter.drawLine(14, 6, 11, 9)
+        painter.drawLine(16, 12, 4, 12)
+        painter.drawLine(7, 9, 4, 12)
+        painter.drawLine(4, 12, 7, 15)
+    elif page == "Messages":
+        painter.drawRoundedRect(QRect(2, 3, 14, 11), 2, 2)
+        painter.drawLine(5, 14, 3, 17)
+        painter.drawLine(5, 7, 13, 7)
+        painter.drawLine(5, 10, 11, 10)
+    elif page == "Feed":
+        painter.drawEllipse(QPoint(4, 14), 1, 1)
+        painter.drawArc(QRect(2, 7, 9, 9), 0, 90 * 16)
+        painter.drawArc(QRect(2, 3, 14, 14), 0, 90 * 16)
+    elif page == "Games":
+        painter.drawRoundedRect(QRect(2, 6, 14, 8), 3, 3)
+        painter.drawLine(5, 8, 5, 12)
+        painter.drawLine(3, 10, 7, 10)
+        painter.drawPoint(12, 9)
+        painter.drawPoint(14, 11)
+    elif page == "Activity":
+        painter.drawLine(2, 14, 5, 10)
+        painter.drawLine(5, 10, 8, 12)
+        painter.drawLine(8, 12, 12, 4)
+        painter.drawLine(12, 4, 16, 7)
+    else:
+        painter.drawEllipse(QRect(3, 3, 12, 12))
+        painter.drawEllipse(QRect(7, 7, 4, 4))
+    painter.end()
+    return QIcon(pixmap)

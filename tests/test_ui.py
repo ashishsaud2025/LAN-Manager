@@ -32,24 +32,114 @@ def window(monkeypatch: pytest.MonkeyPatch) -> object:
 
     app = QApplication.instance() or QApplication([])
     result = MainWindow(_service())
+    result.show()
+    app.processEvents()
     yield result
     result.close()
     app.processEvents()
 
 
 def test_navigation_shell_exposes_phase_one_pages(window: object) -> None:
-    assert window.stack.count() == 10
-    assert len(window.navigation.page_items) == 10
+    from PySide6.QtWidgets import QFrame
+
+    assert window.stack.count() == 11
+    assert len(window.navigation.page_items) == 11
+    assert window.page_names == (
+        "Overview", "Network", "Devices", "Workbench", "Files", "Transfers",
+        "Messages", "Feed", "Games", "Activity", "Settings")
     window.navigation.select(4)
     assert window.stack.currentIndex() == 4
     window.shortcuts[1].activated.emit()
     assert window.stack.currentIndex() == 1
     window.shortcuts[3].activated.emit()
-    assert window.stack.currentIndex() == 7
+    assert window.stack.currentIndex() == 3
     assert "Unverified LAN" in window.security_status.text()
+    assert window.findChild(QFrame, "ApplicationHeader") is not None
+    assert window.findChild(QFrame, "ApplicationFooter") is not None
     labels = [window.navigation.list.item(row).text()
               for row in range(window.navigation.list.count())]
-    assert not any("planned" in label.lower() for label in labels)
+    assert labels == [
+        "CONTROL", "Overview", "Network", "Devices", "Workbench",
+        "SHARE", "Files", "Transfers",
+        "COMMUNITY", "Messages", "Feed", "Games",
+        "SYSTEM", "Activity", "Settings",
+    ]
+
+
+def test_navigation_supports_mouse_and_keyboard(window: object) -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    files_item = window.navigation.page_items[4]
+    window.navigation.list.scrollToItem(files_item)
+    QTest.qWait(10)
+    files_rect = window.navigation.list.visualItemRect(files_item)
+    QTest.mouseClick(window.navigation.list.viewport(),
+                     Qt.MouseButton.LeftButton, pos=files_rect.center())
+    selected_page = window.navigation.list.currentItem().data(256)
+    assert isinstance(selected_page, int)
+    assert selected_page != 0
+    assert window.stack.currentIndex() == selected_page
+
+    window.navigation.select(0)
+    window.navigation.list.setFocus()
+    QTest.keyClick(window.navigation.list, Qt.Key.Key_Down)
+    assert window.stack.currentIndex() == 1
+
+
+def test_shell_adapts_to_narrow_logical_width(window: object) -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from gui.theme import GEOMETRY
+
+    window.resize(900, 600)
+    QTest.qWait(10)
+    assert window.navigation.width() == GEOMETRY["navigation_compact"]
+    assert window.overview_splitter.orientation() == Qt.Orientation.Vertical
+    assert window.peer_splitter.orientation() == Qt.Orientation.Vertical
+    assert window.workbench_splitter.orientation() == Qt.Orientation.Vertical
+    assert window.overview_metrics.getItemPosition(2)[:2] == (1, 0)
+    assert (window.minimumWidth(), window.minimumHeight()) == (640, 360)
+    window.navigation.select(3)
+    workbench_scroll = window.stack.currentWidget()
+    assert workbench_scroll.verticalScrollBar().maximum() > 0
+    workbench_scroll.ensureWidgetVisible(window.admin_cancel_button)
+    QTest.qWait(10)
+    assert workbench_scroll.verticalScrollBar().value() > 0
+
+    window.resize(1200, 760)
+    QTest.qWait(10)
+    assert window.navigation.width() == GEOMETRY["navigation_compact"]
+    assert window.overview_splitter.orientation() == Qt.Orientation.Vertical
+    assert window.overview_metrics.getItemPosition(2)[:2] == (1, 0)
+    for index in range(4):
+        window.stack.setCurrentIndex(index)
+        QTest.qWait(1)
+        assert window.stack.widget(index).horizontalScrollBar().maximum() == 0
+
+
+def test_shell_keeps_wide_layout_at_target_desktop_sizes(window: object) -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from gui.theme import GEOMETRY
+
+    for width, height in ((1600, 900), (1920, 1080)):
+        window.resize(width, height)
+        QTest.qWait(10)
+        assert window.navigation.width() == GEOMETRY["navigation"]
+        assert window.overview_splitter.orientation() == Qt.Orientation.Horizontal
+        assert window.identity_status.isVisible()
+        assert window.network_status.isVisible()
+        for index in range(4):
+            window.stack.setCurrentIndex(index)
+            QTest.qWait(1)
+            assert window.stack.widget(index).horizontalScrollBar().maximum() == 0
+
+
+def test_theme_selector_lists_only_implemented_modes(window: object) -> None:
+    assert [window.theme_selector.itemData(index)
+            for index in range(window.theme_selector.count())] == [
+                "observatory", "atlas"]
 
 
 def test_overview_starts_with_intentional_empty_states(window: object) -> None:
@@ -71,6 +161,9 @@ def test_overview_surfaces_live_network_and_activity(window: object) -> None:
     assert window.overview_topology.peers == (peer,)
     assert window.capability_value.text() == "4"
     window.overview_peer_list.clicked.emit(window.peer_model.index(0, 0))
+    assert window.stack.currentIndex() == 0
+    assert window.overview_peer_name.text() == peer.hello.name
+    window.overview_peer_list.activated.emit(window.peer_model.index(0, 0))
     assert window.stack.currentIndex() == 2
     assert window._selected_peer() == peer
 
@@ -82,7 +175,7 @@ def test_overview_surfaces_live_network_and_activity(window: object) -> None:
 
 def test_security_chip_opens_security_details(window: object) -> None:
     window.security_status.click()
-    assert window.stack.currentIndex() == 9
+    assert window.stack.currentIndex() == 10
 
 
 def test_admin_inventory_keeps_neighbor_and_peer_evidence_separate(window: object) -> None:
@@ -102,10 +195,39 @@ def test_device_inspector_prefills_admin_target(window: object) -> None:
     window.service.events.put(("roster", (peer,)))
     window.drain()
     window._open_peer_admin()
-    assert window.stack.currentIndex() == 7
+    assert window.stack.currentIndex() == 3
     assert window.admin_address.text() == peer.ip
     assert window.admin_port.value() == peer.hello.tcp_port
     assert "not authenticated" in window.admin_selection.text()
+    assert window.admin_echo_button.isEnabled()
+
+
+def test_admin_echo_uses_selected_advertised_session(
+        window: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    peer = _peer()
+    window.service.events.put(("roster", (peer,)))
+    window.drain()
+    window._open_peer_admin()
+    identifier = str(uuid4())
+    called = []
+
+    def echo(address: str, port: int, peer_id: str, session_id: str) -> str:
+        called.append((address, port, peer_id, session_id))
+        return identifier
+
+    monkeypatch.setattr(window.service.diagnostics, "echo", echo)
+    window._echo_admin_target()
+    assert called == [(peer.ip, peer.hello.tcp_port,
+                       peer.hello.peer_id, peer.hello.session_id)]
+    assert not window.admin_echo_button.isEnabled()
+    window.service.events.put(("diagnostic_result", ProbeResult(
+        identifier, "echo", peer.ip, peer.hello.tcp_port, "compatible", 2.0,
+        "correlated reply")))
+    window.drain()
+    assert "compatible" in window.admin_result.text()
+    assert window.admin_echo_button.isEnabled()
+    window.admin_address.setText("192.168.1.99")
+    assert not window.admin_echo_button.isEnabled()
 
 
 def test_admin_probe_result_is_operational_activity(window: object,
@@ -137,6 +259,183 @@ def test_topology_tracks_observed_sessions(window: object) -> None:
     assert window._selected_peer().hello.session_id == peer.hello.session_id
 
 
+def test_network_selection_updates_evidence_hud(window: object) -> None:
+    peer = _peer()
+    window.service.events.put(("roster", (peer,)))
+    window.drain()
+    window._network_peer_selected(peer.hello.session_id)
+    assert window.network_selected_name.text() == peer.hello.name
+    assert peer.ip in window.network_selected_detail.text()
+    assert "Unverified" in window.network_selected_detail.text()
+    assert window.network_observed_value.text() == "1"
+
+
+def test_device_table_filters_observed_fields(window: object) -> None:
+    first, second = _peer(), _peer()
+    second = Peer(second.hello, "10.20.30.40", second.last_seen)
+    window.service.events.put(("roster", (first, second)))
+    window.drain()
+    assert window.peer_table_model.rowCount() == 2
+    window.device_search.setText("10.20.30.40")
+    assert window.peer_list.isRowHidden(0)
+    assert not window.peer_list.isRowHidden(1)
+    assert window.peer_selection.session_id == first.hello.session_id
+    window.device_search.setText("50101")
+    assert not window.peer_list.isRowHidden(0)
+    window.device_search.setText("Files")
+    assert not window.peer_list.isRowHidden(0)
+    window.device_search.clear()
+    assert not window.peer_list.isRowHidden(0)
+
+
+def test_device_filters_use_canonical_evidence_states(window: object) -> None:
+    from core.diagnostics import ProbeResult
+
+    first, second = _peer(), _peer()
+    window.service.events.put(("roster", (first, second)))
+    window.drain()
+    window.service.peer_repository.register_probe(
+        "echo", first.hello.session_id, first.ip, first.hello.tcp_port, "echo")
+    event = window.service.peer_repository.apply_probe_result(ProbeResult(
+        "echo", "echo", first.ip, first.hello.tcp_port, "compatible", 2.0))
+    window._update_peer_records(event.snapshot)
+    window.service.events.put(("roster", (first,)))
+    window.drain()
+
+    assert [window.device_filter.itemData(index)
+            for index in range(window.device_filter.count())] == [
+                "all", "nearby", "reachable", "compatible", "stale"]
+    window.device_filter.setCurrentIndex(window.device_filter.findData("compatible"))
+    assert not window.peer_list.isRowHidden(0)
+    assert window.peer_list.isRowHidden(1)
+    window.device_filter.setCurrentIndex(window.device_filter.findData("stale"))
+    assert window.peer_list.isRowHidden(0)
+    assert not window.peer_list.isRowHidden(1)
+
+
+def test_device_inspector_uses_known_and_unknown_evidence(window: object) -> None:
+    peer = _peer()
+    window.service.events.put(("roster", (peer,)))
+    window.drain()
+    assert window.peer_host.text() == "Hostname: Not advertised"
+    assert window.peer_platform.text() == "Platform / architecture: Not advertised"
+    assert window.peer_mac.text() == "MAC address: Not observed"
+    assert window.peer_latency.text() == "Latency: Not measured"
+    assert window.peer_services.text().endswith("None observed")
+    assert "Cryptographic Trust: Unverified" in window.peer_warning.text()
+    assert "No authenticated device identity" in window.peer_warning.text()
+
+
+def test_shared_peer_selection_updates_all_surfaces(window: object) -> None:
+    first, second = _peer(), _peer()
+    window.service.events.put(("roster", (first, second)))
+    window.drain()
+    window.peer_list.setCurrentIndex(window.peer_table_model.index(1, 0))
+    assert window.peer_selection.session_id == second.hello.session_id
+    assert window.overview_peer_list.currentIndex().row() == 1
+    assert window.overview_peer_name.text() == second.hello.name
+    assert window.network_selected_name.text() == second.hello.name
+    assert {item.data(0) for item in window.topology.scene.selectedItems()} == {
+        second.hello.session_id}
+    window._copy_peer_address()
+    from PySide6.QtWidgets import QApplication
+    assert QApplication.clipboard().text() == second.ip
+
+
+def test_older_repository_revision_cannot_replace_newer_evidence(window: object) -> None:
+    from core.diagnostics import ProbeResult
+
+    peer = _peer()
+    presence = window.service.peer_repository.reconcile_presence((peer,), 10)
+    window.service.peer_repository.register_probe(
+        "echo", peer.hello.session_id, peer.ip, peer.hello.tcp_port, "echo")
+    verified = window.service.peer_repository.apply_probe_result(ProbeResult(
+        "echo", "echo", peer.ip, peer.hello.tcp_port, "compatible"))
+    window._apply_repository_event(verified)
+    window._apply_repository_event(presence)
+    assert "Compatible" in window.peer_compatible_evidence.text()
+    assert window.peer_records[0].compatibility_state.value == "compatible"
+
+
+def test_inspector_waits_for_repository_revision_before_rendering(window: object) -> None:
+    peer = _peer()
+    repository = window.service.peer_repository
+    nearby = repository.reconcile_presence((peer,), 10)
+    window._apply_repository_event(nearby)
+    stale = repository.reconcile_presence((), 11)
+
+    window._show_peer(window._selected_record())
+    assert window.peer_presence.text().startswith("Nearby")
+    window._apply_repository_event(stale)
+    assert window.peer_presence.text().startswith("Offline / stale")
+
+
+def test_overview_nearby_list_excludes_retained_stale_records(window: object) -> None:
+    peer = _peer()
+    window.service.events.put(("roster", (peer,)))
+    window.drain()
+    window.service.events.put(("roster", ()))
+    window.drain()
+    assert window.peer_table_model.rowCount() == 1
+    assert window.peer_model.rowCount() == 0
+    assert window.overview_nearby_stack.currentWidget() is window.overview_nearby_empty
+    assert window.peer_selection.session_id == peer.hello.session_id
+    assert "Offline / stale" in window.peer_presence.text()
+
+
+def test_selection_clears_when_retained_stale_record_is_purged(window: object) -> None:
+    peer = _peer()
+    repository = window.service.peer_repository
+    repository.stale_retention = 1.0
+    window._apply_repository_event(repository.reconcile_presence((peer,), 10))
+    window._apply_repository_event(repository.reconcile_presence((), 11))
+    assert window.peer_selection.session_id == peer.hello.session_id
+    window._apply_repository_event(repository.reconcile_presence((), 12))
+    assert window.peer_selection.session_id is None
+    assert window.peer_table_model.rowCount() == 0
+    assert window.peer_name.text() == "Select a nearby session"
+
+
+def test_stale_repository_session_cannot_launch_cached_echo(
+        window: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    peer = _peer()
+    window.service.events.put(("roster", (peer,)))
+    window.drain()
+    window._open_peer_admin()
+    called = []
+    monkeypatch.setattr(
+        window.service.diagnostics, "echo",
+        lambda *args: called.append(args) or str(uuid4()))
+    window.service.peer_repository.reconcile_presence((), time.monotonic())
+    window._queue_admin_probe("echo")
+    assert called == []
+    assert "unchanged LAN Atlas session" in window.admin_result.text()
+
+
+def test_network_and_overview_selection_survive_roster_refresh(window: object) -> None:
+    first, second = _peer(), _peer()
+    window.service.events.put(("roster", (first, second)))
+    window.drain()
+    window._network_peer_selected(second.hello.session_id)
+    window._overview_peer_previewed(window.peer_model.index(1, 0))
+
+    refreshed_second = Peer(second.hello, second.ip, time.monotonic())
+    window.service.events.put(("roster", (refreshed_second, first)))
+    window.drain()
+
+    assert window.peer_selection.session_id == second.hello.session_id
+    assert {item.data(0) for item in window.topology.scene.selectedItems()} == {
+        second.hello.session_id}
+    assert window.overview_peer_name.text() == second.hello.name
+
+    window.service.events.put(("roster", (first,)))
+    window.drain()
+    assert window.peer_selection.session_id == second.hello.session_id
+    assert "Offline / stale" in window.overview_peer_detail.text()
+    assert not window.peer_message_button.isEnabled()
+    assert not window.peer_file_button.isEnabled()
+
+
 def test_roster_updates_peer_model_and_capability_actions(window: object) -> None:
     peer = _peer()
     window.service.events.put(("roster", (peer,)))
@@ -154,7 +453,7 @@ def test_peer_selection_survives_roster_refresh(window: object) -> None:
     first, second = _peer(), _peer()
     window.service.events.put(("roster", (first, second)))
     window.drain()
-    window.peer_list.setCurrentIndex(window.peer_model.index(1, 0))
+    window.peer_list.setCurrentIndex(window.peer_table_model.index(1, 0))
     assert window._selected_peer().hello.session_id == second.hello.session_id
     refreshed_second = Peer(second.hello, second.ip, time.monotonic())
     window.service.events.put(("roster", (refreshed_second, first)))
