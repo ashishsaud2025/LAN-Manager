@@ -8,12 +8,19 @@ from typing import Final
 from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtWidgets import QApplication
 
+from gui.theme.fonts import ensure_application_fonts
+from gui.theme.stylesheet import build_stylesheet
+from gui.theme.tokens import BUTTON_RADIUS_PX, COLORS, RADIUS, SPACE
+
 SPACING: Final[dict[str, int]] = {
-    "xs": 4, "sm": 8, "md": 12, "lg": 20, "xl": 28,
+    "xs": SPACE["xs"], "sm": SPACE["sm"], "md": SPACE["md"],
+    "lg": SPACE["lg"], "xl": SPACE["xl"],
 }
-RADII: Final[dict[str, int]] = {"sm": 4, "control": 6, "card": 8}
+RADII: Final[dict[str, int]] = {
+    "sm": RADIUS["sm"], "control": BUTTON_RADIUS_PX, "card": RADIUS["DEFAULT"],
+}
 GEOMETRY: Final[dict[str, int]] = {
-    "navigation": 280,
+    "navigation": 220,
     "navigation_compact": 176,
     "responsive_breakpoint": 1500,
     "minimum_width": 640,
@@ -25,18 +32,30 @@ TYPOGRAPHY: Final[dict[str, int]] = {
 
 THEMES: Final[dict[str, dict[str, str]]] = {
     "observatory": {
-        "canvas": "#051424", "surface": "#122131", "raised": "#1C2B3C",
-        "nav": "#010F1F", "ink": "#D4E4FA", "secondary": "#BACAC4",
-        "border": "#273647", "accent": "#46EFCF", "signal": "#2ADEC0",
-        "success": "#46EFCF", "warning": "#FFB95F", "failure": "#FFB4AB",
-        "selection": "#1C2B3C", "field": "#0D1C2D", "muted": "#0D1C2D",
-        "warning_bg": "#2A1D0D", "warning_border": "#653E00",
-        "warning_text": "#FFCE94", "nav_text": "#BACAC4",
-        "nav_selection": "#1C2B3C", "scroll_handle": "#3B4A45",
-        "on_accent": "#00382E", "hover_ink": "#00382E", "brand": "#D4E4FA",
+        "canvas": COLORS["background"], "surface": COLORS["surface-container"],
+        "raised": COLORS["surface-container-high"],
+        "nav": COLORS["surface-container-lowest"], "ink": COLORS["on-surface"],
+        "secondary": COLORS["on-surface-variant"],
+        "border": COLORS["surface-container-highest"],
+        "accent": COLORS["primary"], "signal": COLORS["surface-tint"],
+        "success": COLORS["primary"], "warning": COLORS["tertiary-fixed-dim"],
+        "failure": COLORS["error"],
+        "selection": COLORS["surface-container-high"],
+        "field": COLORS["surface-container-low"],
+        "muted": COLORS["surface-container-low"],
+        "warning_bg": "#2A1D0D",
+        "warning_border": COLORS["on-tertiary-fixed-variant"],
+        "warning_text": COLORS["tertiary"],
+        "nav_text": COLORS["on-surface-variant"],
+        "nav_selection": COLORS["surface-container-high"],
+        "scroll_handle": COLORS["outline-variant"],
+        "on_accent": COLORS["on-primary"], "hover_ink": COLORS["on-primary"],
+        "brand": COLORS["on-surface"],
         "nav_group": "#64748B", "tooltip_ink": "#FFFFFF",
-        "surface_lowest": "#010F1F", "surface_low": "#0D1C2D",
-        "surface_high": "#1C2B3C", "surface_highest": "#273647",
+        "surface_lowest": COLORS["surface-container-lowest"],
+        "surface_low": COLORS["surface-container-low"],
+        "surface_high": COLORS["surface-container-high"],
+        "surface_highest": COLORS["surface-container-highest"],
     },
     "atlas": {
         "canvas": "#F3F0E8", "surface": "#FFFDF7", "raised": "#FFFFFF",
@@ -59,6 +78,7 @@ def apply_theme(app: QApplication, mode: str = "observatory") -> str:
     """Apply a named theme and return the effective mode."""
     effective = mode if mode in THEMES else "observatory"
     colors = THEMES[effective]
+    ensure_application_fonts(app)
     families = QFontDatabase.families()
     platform_ui = "Segoe UI" if sys.platform == "win32" else app.font().family()
     family = next((name for name in ("Inter", "Segoe UI", "Noto Sans")
@@ -68,7 +88,7 @@ def apply_theme(app: QApplication, mode: str = "observatory") -> str:
                                         "Consolas", "Noto Sans Mono")
                       if name in families), platform_mono)
     app.setFont(QFont(family, TYPOGRAPHY["body"]))
-    app.setStyleSheet(_stylesheet(colors, technical))
+    app.setStyleSheet(_stylesheet(colors, technical) + build_stylesheet())
     return effective
 
 
