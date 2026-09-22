@@ -8,6 +8,7 @@ import errno
 from ipaddress import IPv4Address, ip_address
 import json
 import logging
+import math
 from queue import Empty, Full, Queue
 import re
 import socket
@@ -71,6 +72,7 @@ class ProbeResult:
     state: str
     duration_ms: float | None = None
     detail: str = ""
+    rtt_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -313,15 +315,16 @@ class DiagnosticsService:
         command = (["ping", "-n", "1", "-w", "1500", request.address]
                    if self._platform.startswith("win")
                    else ["ping", "-c", "1", "-W", "2", request.address])
-        started = time.monotonic()
+        started = time.perf_counter()
         try:
             code, output, error = self._command_runner(command, PING_TIMEOUT)
-            duration = (time.monotonic() - started) * 1000
+            duration = (time.perf_counter() - started) * 1000
             state = "cancelled" if self._cancelled() else (
                 "reachable" if code == 0 else "no_reply")
             detail = _detail(output if code == 0 else error or output)
+            rtt = parse_ping_rtt(output) if state == "reachable" else None
             result = ProbeResult(request.request_id, "ping", request.address, None,
-                                 state, duration, detail)
+                                 state, duration, detail, rtt)
         except (DiagnosticsError, OSError) as error:
             state = "cancelled" if self._cancelled() else "failed"
             result = ProbeResult(request.request_id, "ping", request.address, None,
@@ -331,18 +334,20 @@ class DiagnosticsService:
     def _tcp_connect(self, request: _Request) -> None:
         self._event("diagnostic_started", ProbeResult(
             request.request_id, "tcp", request.address, request.port, "running"))
-        started = time.monotonic()
+        started = time.perf_counter()
         active_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         active_socket.settimeout(TCP_TIMEOUT)
         with self._lock:
             self._socket = active_socket
         try:
             active_socket.connect((request.address, request.port))
+            duration = (time.perf_counter() - started) * 1000
+            state = "cancelled" if self._cancelled() else "reachable"
+            rtt = duration if state == "reachable" and _valid_rtt(duration) else None
             result = ProbeResult(
                 request.request_id, "tcp", request.address, request.port,
-                "cancelled" if self._cancelled() else "reachable",
-                (time.monotonic() - started) * 1000,
-                "TCP handshake completed; no application data was sent")
+                state, duration,
+                "TCP handshake completed; no application data was sent", rtt)
         except ConnectionRefusedError as error:
             result = self._tcp_failure(request, started, "refused", error)
         except (TimeoutError, socket.timeout) as error:
@@ -362,24 +367,29 @@ class DiagnosticsService:
                      error: OSError) -> ProbeResult:
         if self._cancelled():
             state = "cancelled"
+        duration = (time.perf_counter() - started) * 1000
+        rtt = duration if state == "refused" and _valid_rtt(duration) else None
         return ProbeResult(request.request_id, "tcp", request.address, request.port,
-                           state, (time.monotonic() - started) * 1000, str(error))
+                           state, duration, str(error), rtt)
 
     def _echo(self, request: _Request) -> None:
         self._event("diagnostic_started", ProbeResult(
             request.request_id, "echo", request.address, request.port, "running"))
-        started = time.monotonic()
+        started = time.perf_counter()
         active_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         active_socket.settimeout(TCP_TIMEOUT)
         with self._lock:
             self._socket = active_socket
+        exchange_ms: float | None = None
         try:
             active_socket.connect((request.address, request.port))
             body = {"text": f"lan-atlas:{request.request_id}"}
             message = envelope(
                 "ECHO", self._peer_id, self._session_id, body)
+            exchange_start = time.perf_counter()
             send_message(active_socket, message, ECHO_TIMEOUT)
             reply = recv_message(active_socket, ECHO_TIMEOUT)
+            exchange_ms = (time.perf_counter() - exchange_start) * 1000
             if reply is None:
                 raise ProtocolError("ECHO endpoint closed without a reply")
             validate_envelope(reply)
@@ -389,13 +399,17 @@ class DiagnosticsService:
                     or reply["peer_id"] != request.peer_id
                     or reply["session_id"] != request.session_id):
                 raise ProtocolError("ECHO reply correlation or identity mismatch")
+            duration = (time.perf_counter() - started) * 1000
+            state = "cancelled" if self._cancelled() else "compatible"
+            rtt = exchange_ms if state == "compatible" and _valid_rtt(exchange_ms) else None
             result = ProbeResult(
                 request.request_id, "echo", request.address, request.port,
-                "cancelled" if self._cancelled() else "compatible",
-                (time.monotonic() - started) * 1000,
-                "Correlated LAN Manager ECHO_REPLY matched the advertised session")
+                state, duration,
+                "Correlated LAN Manager ECHO_REPLY matched the advertised session",
+                rtt)
         except ProtocolError as error:
-            result = self._echo_failure(request, started, "incompatible", error)
+            result = self._echo_failure(request, started, "incompatible", error,
+                                        exchange_ms)
         except ConnectionRefusedError as error:
             result = self._echo_failure(request, started, "refused", error)
         except (TimeoutError, socket.timeout) as error:
@@ -412,11 +426,17 @@ class DiagnosticsService:
         self._event("diagnostic_result", result)
 
     def _echo_failure(self, request: _Request, started: float, state: str,
-                      error: Exception) -> ProbeResult:
+                      error: Exception, exchange_ms: float | None = None) -> ProbeResult:
         if self._cancelled():
             state = "cancelled"
+        duration = (time.perf_counter() - started) * 1000
+        rtt: float | None = None
+        if state == "incompatible" and exchange_ms is not None and _valid_rtt(exchange_ms):
+            rtt = exchange_ms
+        elif state == "refused" and _valid_rtt(duration):
+            rtt = duration
         return ProbeResult(request.request_id, "echo", request.address, request.port,
-                           state, (time.monotonic() - started) * 1000, str(error))
+                           state, duration, str(error), rtt)
 
     def _run_command(self, command: list[str], timeout: float) -> tuple[int, str, str]:
         try:
@@ -467,6 +487,45 @@ def _validate_uuid(value: str, label: str) -> str:
     except ValueError as error:
         raise ValueError(f"{label} must be a canonical UUID") from error
     return value
+
+
+def parse_ping_rtt(output: str) -> float | None:
+    """Parse measured ICMP RTT without inventing samples.
+
+    Prefers the Windows average and Linux avg summary; falls back to the
+    single-reply time= field used by one-packet probes. Returns None when
+    output has no parseable timing or resolution is zero.
+    """
+    if not output:
+        return None
+    match = re.search(r"Average\s*=\s*<?\s*(\d+(?:\.\d+)?)\s*ms", output)
+    if match:
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            return None
+        return value if _valid_rtt(value) else None
+    match = re.search(
+        r"(?:rtt|round-trip)\s+min/avg/max/(?:mdev|stddev)\s*=\s*"
+        r"[\d.]+/([\d.]+)/[\d.]+/[\d.]+\s*ms", output)
+    if match:
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            return None
+        return value if _valid_rtt(value) else None
+    match = re.search(r"time[=<]\s*(\d+(?:\.\d+)?)\s*ms", output)
+    if match:
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            return None
+        return value if _valid_rtt(value) else None
+    return None
+
+
+def _valid_rtt(value: float) -> bool:
+    return math.isfinite(value) and 0 < value < 60000
 
 
 def _detail(value: str) -> str:

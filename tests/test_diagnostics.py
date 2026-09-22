@@ -10,7 +10,7 @@ import pytest
 
 from core.diagnostics import (
     DiagnosticsService, NeighborSnapshot, ProbeResult, parse_linux_neighbors,
-    parse_windows_neighbors,
+    parse_ping_rtt, parse_windows_neighbors,
 )
 from core.protocol import envelope, recv_message, send_message, validate_envelope
 
@@ -184,3 +184,54 @@ def test_validation_and_queue_bounds_reject_unsafe_requests() -> None:
         service.ping("127.0.0.1")
     service.stop()
     assert service.join(1)
+
+
+def test_parse_ping_rtt_prefers_measured_average_without_invention() -> None:
+    windows = ("Reply from 192.168.1.20: bytes=32 time=1ms TTL=128\n\n"
+               "Ping statistics:\n    Minimum = 1ms, Maximum = 1ms, Average = 1ms")
+    assert parse_ping_rtt(windows) == 1.0
+    linux = ("64 bytes from 192.168.1.20: icmp_seq=1 ttl=64 time=0.42 ms\n\n"
+             "rtt min/avg/max/mdev = 0.410/0.420/0.430/0.010 ms")
+    assert parse_ping_rtt(linux) == 0.42
+    assert parse_ping_rtt("Reply from 192.168.1.20: bytes=32 time<1ms TTL=128\n"
+                          "Average = 0ms") is None
+    assert parse_ping_rtt("") is None
+    assert parse_ping_rtt("no timing information here") is None
+
+
+def test_echo_result_carries_exchange_rtt_for_compatible_reply() -> None:
+    events, emit = _events()
+    remote_peer_id, remote_session_id = str(uuid4()), str(uuid4())
+    errors: list[Exception] = []
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(2)
+
+        def respond() -> None:
+            try:
+                conn, _ = listener.accept()
+                with conn:
+                    request = recv_message(conn)
+                    send_message(conn, envelope(
+                        "ECHO_REPLY", remote_peer_id, remote_session_id,
+                        request["body"], request["message_id"]))
+            except Exception as error:
+                errors.append(error)
+
+        server = threading.Thread(target=respond, daemon=True)
+        server.start()
+        service = DiagnosticsService(emit)
+        service.start()
+        service.echo("127.0.0.1", listener.getsockname()[1],
+                     remote_peer_id, remote_session_id)
+        assert events.get(timeout=2)[0] == "diagnostic_started"
+        kind, result = events.get(timeout=2)
+        service.stop()
+        assert service.join(2)
+        server.join(2)
+    assert not errors
+    assert kind == "diagnostic_result"
+    assert result.state == "compatible"
+    assert result.rtt_ms is not None and 0 < result.rtt_ms < 60000
+    assert result.duration_ms is not None and result.rtt_ms <= result.duration_ms
