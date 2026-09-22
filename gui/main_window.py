@@ -30,6 +30,7 @@ from gui.models import (
     MessageEntry, MessageListModel, PeerListModel, PeerTableModel, PostListModel,
     TransferListModel, capability_label,
 )
+from gui.latency_map import LatencyMap
 from gui.peer_selection import PeerSelection
 from gui.theme import GEOMETRY, SPACING, apply_theme
 from gui.topology import NetworkTopology
@@ -261,25 +262,35 @@ class MainWindow(QMainWindow):
         network = QFrame()
         network.setProperty("panel", True)
         network_layout = QVBoxLayout(network)
-        network_heading = QLabel("OBSERVED NETWORK")
+        network_heading = QLabel("LATENCY MAP (OBSERVED RTT)")
         network_heading.setObjectName("SectionLabel")
         network_layout.addWidget(network_heading)
-        self.overview_topology = NetworkTopology(
-            self.service.hello, self.theme_mode, show_note=False)
-        self.overview_topology.device_selected.connect(self._topology_device_selected)
+        self.overview_topology = LatencyMap(self.service.hello, self.theme_mode)
+        self.overview_topology.device_selected.connect(self._overview_map_selected)
         network_layout.addWidget(self.overview_topology, 1)
         self.overview_splitter.addWidget(network)
 
         metrics_panel = QFrame()
         metrics_panel.setProperty("panel", True)
         metrics_layout = QVBoxLayout(metrics_panel)
-        metrics_heading = QLabel("OBSERVATION METRICS")
+        metrics_heading = QLabel("LATENCY & METRICS")
         metrics_heading.setObjectName("PanelTitle")
         metrics_layout.addWidget(metrics_heading)
         metrics_layout.addLayout(self.overview_metrics)
+        self.overview_summary = QLabel("Searching your LAN for observed hosts...")
+        self.overview_summary.setObjectName("TechnicalDetail")
+        self.overview_summary.setWordWrap(True)
+        metrics_layout.addWidget(self.overview_summary)
+        self.overview_rtt = QLabel("Measured latency: none yet")
+        self.overview_rtt.setObjectName("TechnicalDetail")
+        self.overview_rtt.setWordWrap(True)
+        metrics_layout.addWidget(self.overview_rtt)
         metrics_note = QLabel(
-            "Counts come from current HELLO observations and local transfer state. "
-            "No latency or reachability is inferred.")
+            "Counts come from the canonical repository. "
+            "Radial distance uses measured latency only "
+            "(ping RTT, TCP handshake, or ECHO round-trip); "
+            "unmeasured peers use a grey ring. "
+            "No physical topology is inferred.")
         metrics_note.setObjectName("PageSubtitle")
         metrics_note.setWordWrap(True)
         metrics_layout.addWidget(metrics_note)
@@ -327,6 +338,9 @@ class MainWindow(QMainWindow):
         self.overview_peer_detail.setWordWrap(True)
         self.overview_peer_caps = QLabel("Presence only")
         self.overview_peer_caps.setProperty("chip", True)
+        self.overview_peer_rtt = QLabel("Measured latency: none yet")
+        self.overview_peer_rtt.setObjectName("TechnicalDetail")
+        self.overview_peer_rtt.setWordWrap(True)
         overview_trust = QLabel("◇  Cryptographic trust: Unverified")
         overview_trust.setProperty("warning", True)
         overview_trust.setWordWrap(True)
@@ -334,6 +348,7 @@ class MainWindow(QMainWindow):
         inspector_layout.addWidget(self.overview_peer_name)
         inspector_layout.addWidget(self.overview_peer_detail)
         inspector_layout.addWidget(self.overview_peer_caps)
+        inspector_layout.addWidget(self.overview_peer_rtt)
         inspector_layout.addWidget(overview_trust)
         inspector_layout.addStretch(1)
         inspector_layout.addWidget(action_button(
@@ -1215,8 +1230,10 @@ class MainWindow(QMainWindow):
                     if result.port is not None else result.address)
         duration = (f" · {result.duration_ms:.1f} ms local operation time"
                     if result.duration_ms is not None else "")
+        rtt = (f" · measured latency {result.rtt_ms:.1f} ms via {result.kind}"
+               if result.rtt_ms is not None else "")
         detail = f"\n{result.detail}" if result.detail else ""
-        text = f"{result.kind.upper()} {endpoint}: {result.state}{duration}{detail}"
+        text = f"{result.kind.upper()} {endpoint}: {result.state}{duration}{rtt}{detail}"
         self.append(text.replace("\n", " · "), "Workbench",
                     "warning" if result.state not in {"reachable", "compatible"} else "info")
         if result.request_id != self.active_probe_id:
@@ -1338,7 +1355,7 @@ class MainWindow(QMainWindow):
         self.peer_table_model.set_records(records)
         self._rebuild_admin_devices()
         self.topology.set_peers(nearby_peers)
-        self.overview_topology.set_peers(nearby_peers)
+        self.overview_topology.set_records(nearby)
         self.overview_nearby_stack.setCurrentWidget(
             self.overview_peer_list if nearby else self.overview_nearby_empty)
         self._rebuild_message_recipients(message_selected)
@@ -1359,6 +1376,24 @@ class MainWindow(QMainWindow):
         self.capability_value.setText(str(len(capabilities)) if nearby else "Waiting")
         self.network_observed_value.setText(str(len(nearby)))
         self.network_capability_value.setText(str(len(capabilities)))
+        summary = self.service.peer_repository.overview_summary()
+        if not records:
+            self.overview_summary.setText("Searching your LAN for observed hosts...")
+            self.overview_rtt.setText("Measured latency: none yet")
+        else:
+            self.overview_summary.setText(
+                f"{summary.observed} observed hosts · "
+                f"{summary.responsive} responsive · "
+                f"{summary.stale} offline")
+            if summary.measured and summary.min_ms is not None:
+                self.overview_rtt.setText(
+                    f"Measured latency: min {summary.min_ms:.1f} ms · "
+                    f"avg {summary.avg_ms:.1f} ms · "
+                    f"max {summary.max_ms:.1f} ms "
+                    f"({summary.measured} of {summary.nearby} nearby)")
+            else:
+                self.overview_rtt.setText(
+                    "Measured latency: none yet — run Ping, TCP, or ECHO")
         if len(nearby) != previous_count:
             self.append(f"Nearby roster now contains {len(nearby)} active session(s).",
                         "Discovery")
@@ -1416,6 +1451,7 @@ class MainWindow(QMainWindow):
             self.overview_peer_detail.setText(
                 "Select a retained session to inspect known endpoint evidence.")
             self.overview_peer_caps.setText("Presence only")
+            self.overview_peer_rtt.setText("Measured latency: none yet")
             self.network_selected_name.setText("No session selected")
             self.network_selected_detail.setText(
                 "Choose a node to inspect its observed endpoint and HELLO capabilities.")
@@ -1429,6 +1465,12 @@ class MainWindow(QMainWindow):
             f"Installation {record.hello.peer_id[:12]}…\n"
             f"Session {record.session_id[:12]}…\n{state} · Unverified")
         self.overview_peer_caps.setText("  ·  ".join(labels) or "Presence only")
+        if record.latency_ms is None:
+            self.overview_peer_rtt.setText("Measured latency: none yet")
+        else:
+            source = f" via {record.latency_source}" if record.latency_source else ""
+            self.overview_peer_rtt.setText(
+                f"Measured latency: {record.latency_ms:.1f} ms{source}")
         self.network_selected_name.setText(record.hello.name)
         self.network_selected_detail.setText(
             f"Observed endpoint  {record.ip}:{record.hello.tcp_port}\n"
@@ -1482,8 +1524,11 @@ class MainWindow(QMainWindow):
         mac = record.mac_address or "Not observed"
         source = f" · {record.mac_source}" if record.mac_source else ""
         self.peer_mac.setText(f"MAC address: {mac}{source}")
-        latency = (f"{record.latency_ms:.1f} ms" if record.latency_ms is not None
-                   else "Not measured")
+        if record.latency_ms is None:
+            latency = "Not measured"
+        else:
+            source = f" via {record.latency_source}" if record.latency_source else ""
+            latency = f"{record.latency_ms:.1f} ms{source}"
         self.peer_latency.setText(f"Latency: {latency}")
         labels = [capability_label(item) for item in record.hello.capabilities]
         self.peer_capabilities.setText("  ·  ".join(labels) or "Presence only")
@@ -1569,6 +1614,12 @@ class MainWindow(QMainWindow):
         record = self.peer_model.record_at(index.row())
         if record is not None:
             self.peer_selection.select(record.session_id)
+
+    @Slot(str)
+    def _overview_map_selected(self, session_id: str) -> None:
+        """Preview one latency-map session without leaving Overview."""
+        if self._record_in_snapshot(session_id) is not None:
+            self.peer_selection.select(session_id)
 
     @Slot(QModelIndex)
     def _overview_peer_selected(self, index: QModelIndex) -> None:

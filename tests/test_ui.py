@@ -158,7 +158,8 @@ def test_overview_surfaces_live_network_and_activity(window: object) -> None:
     window.service.events.put(("roster", (peer,)))
     window.drain()
     assert window.overview_nearby_stack.currentWidget() is window.overview_peer_list
-    assert window.overview_topology.peers == (peer,)
+    assert [record.session_id for record in window.overview_topology.records] == [
+        peer.hello.session_id]
     assert window.capability_value.text() == "4"
     window.overview_peer_list.clicked.emit(window.peer_model.index(0, 0))
     assert window.stack.currentIndex() == 0
@@ -529,3 +530,117 @@ def test_listener_failure_updates_prominent_status(window: object) -> None:
     window.service.events.put(("status", "TCP listener stopped: address in use"))
     window.drain()
     assert window.network_status.text() == "Network stopped"
+
+
+def test_overview_summary_reports_observed_responsive_offline(window: object) -> None:
+    first, second = _peer(), _peer()
+    window.service.events.put(("roster", (first, second)))
+    window.drain()
+    window.service.peer_repository.register_probe(
+        "tcp", first.hello.session_id, first.ip, first.hello.tcp_port, "tcp")
+    event = window.service.peer_repository.apply_probe_result(ProbeResult(
+        "tcp", "tcp", first.ip, first.hello.tcp_port, "reachable", 4.0, "", 2.0))
+    window._apply_repository_event(event)
+    assert "2 observed hosts" in window.overview_summary.text()
+    assert "1 responsive" in window.overview_summary.text()
+    assert "0 offline" in window.overview_summary.text()
+    assert "min 2.0 ms" in window.overview_rtt.text()
+    window.service.events.put(("roster", (first,)))
+    window.drain()
+    assert "2 observed hosts" in window.overview_summary.text()
+    assert "1 offline" in window.overview_summary.text()
+
+
+def test_overview_latency_map_encodes_measured_latency_by_radius(window: object) -> None:
+    from gui.latency_map import (
+        INNER_RADIUS, OUTER_RADIUS, UNMEASURED_RADIUS, radius_for_latency,
+    )
+
+    first, second, third = _peer(), _peer(), _peer()
+    window.service.events.put(("roster", (first, second, third)))
+    window.drain()
+    for identifier, peer, rtt in (("one", first, 1.0), ("two", second, 9.0)):
+        window.service.peer_repository.register_probe(
+            identifier, peer.hello.session_id, peer.ip, peer.hello.tcp_port,
+            "tcp")
+        event = window.service.peer_repository.apply_probe_result(ProbeResult(
+            identifier, "tcp", peer.ip, peer.hello.tcp_port,
+            "reachable", rtt + 0.5, "", rtt))
+        window._apply_repository_event(event)
+    positions = {}
+    for item in window.overview_topology.scene.items():
+        session_id = item.data(0)
+        if isinstance(session_id, str) and session_id:
+            positions[session_id] = item.pos()
+    assert set(positions) == {
+        first.hello.session_id, second.hello.session_id, third.hello.session_id}
+
+    def radius(session_id: str) -> float:
+        pos = positions[session_id]
+        return (((pos.x() - 450.0) ** 2 + (pos.y() - 260.0) ** 2) ** 0.5)
+
+    assert radius(first.hello.session_id) < radius(second.hello.session_id)
+    assert abs(radius(third.hello.session_id) - UNMEASURED_RADIUS) < 1.0
+    assert INNER_RADIUS <= radius(first.hello.session_id) <= OUTER_RADIUS
+    assert abs(radius(first.hello.session_id) - radius_for_latency(1.0)) < 1.0
+    assert abs(radius(second.hello.session_id) - radius_for_latency(9.0)) < 1.0
+    assert "2 of 3 nearby" in window.overview_rtt.text()
+    window.peer_selection.select(third.hello.session_id)
+    assert window.overview_peer_rtt.text() == "Measured latency: none yet"
+    window.peer_selection.select(second.hello.session_id)
+    assert "9.0 ms via tcp" in window.overview_peer_rtt.text()
+    assert "9.0 ms via tcp" in window.peer_latency.text()
+
+
+def test_latency_map_uses_stable_scale_for_single_peer(window: object) -> None:
+    from gui.latency_map import radius_for_latency
+
+    peer = _peer()
+    window.service.events.put(("roster", (peer,)))
+    window.drain()
+    window.service.peer_repository.register_probe(
+        "single", peer.hello.session_id, peer.ip, peer.hello.tcp_port, "tcp")
+    event = window.service.peer_repository.apply_probe_result(ProbeResult(
+        "single", "tcp", peer.ip, peer.hello.tcp_port, "reachable", 2.0, "", 1.0))
+    window._apply_repository_event(event)
+    positions = {item.data(0): item.pos()
+                 for item in window.overview_topology.scene.items()
+                 if isinstance(item.data(0), str) and item.data(0)}
+    pos = positions[peer.hello.session_id]
+    radius = (((pos.x() - 450.0) ** 2 + (pos.y() - 260.0) ** 2) ** 0.5)
+    assert abs(radius - radius_for_latency(1.0)) < 1.0
+
+
+def test_overview_map_preview_does_not_leave_overview(window: object) -> None:
+    first, second = _peer(), _peer()
+    window.service.events.put(("roster", (first, second)))
+    window.drain()
+    window.navigation.select(0)
+    assert window.stack.currentIndex() == 0
+    window.overview_topology.device_selected.emit(second.hello.session_id)
+    assert window.stack.currentIndex() == 0
+    assert window.peer_selection.session_id == second.hello.session_id
+    assert window.overview_peer_name.text() == second.hello.name
+
+
+def test_latency_map_selection_flows_to_shared_devices_selection(window: object) -> None:
+    first, second = _peer(), _peer()
+    window.service.events.put(("roster", (first, second)))
+    window.drain()
+    window.overview_topology.device_selected.emit(second.hello.session_id)
+    assert window.peer_selection.session_id == second.hello.session_id
+    assert window.peer_name.text() == second.hello.name
+
+
+def test_latency_map_handles_dozens_of_peers_without_animation(window: object) -> None:
+    from PySide6.QtTest import QTest
+
+    peers = tuple(_peer() for _ in range(40))
+    window.service.events.put(("roster", peers))
+    window.drain()
+    assert len(window.overview_topology.records) == 40
+    assert window.overview_topology.select_session(peers[20].hello.session_id)
+    window.resize(1600, 900)
+    QTest.qWait(10)
+    assert window.stack.widget(0).horizontalScrollBar().maximum() == 0
+    assert "40 observed hosts" in window.overview_summary.text()
