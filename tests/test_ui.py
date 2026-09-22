@@ -432,9 +432,70 @@ def test_network_and_overview_selection_survive_roster_refresh(window: object) -
     window.service.events.put(("roster", (first,)))
     window.drain()
     assert window.peer_selection.session_id == second.hello.session_id
-    assert "Offline / stale" in window.overview_peer_detail.text()
+    assert "Offline / stale" in window.overview_peer_state.text()
     assert not window.peer_message_button.isEnabled()
     assert not window.peer_file_button.isEnabled()
+
+
+def test_selected_session_renders_structured_rows_not_joined_text(
+        window: object) -> None:
+    peer = _peer()
+    window.service.events.put(("roster", (peer,)))
+    window.drain()
+    assert window.overview_peer_endpoint.text() == (
+        f"{peer.ip}:{peer.hello.tcp_port}")
+    assert window.overview_peer_installation.text() == (
+        f"{peer.hello.peer_id[:12]}…")
+    assert window.overview_peer_installation.toolTip() == peer.hello.peer_id
+    assert window.overview_peer_session.text() == (
+        f"{peer.hello.session_id[:12]}…")
+    assert window.overview_peer_session.toolTip() == peer.hello.session_id
+    assert "Nearby" in window.overview_peer_state.text()
+    assert "Unverified" in window.overview_peer_state.text()
+    assert "\n" not in window.overview_peer_endpoint.text()
+
+
+def test_inspector_state_matches_list_pill_across_transitions(
+        window: object) -> None:
+    from gui.widgets.peer_row import peer_state, pill_display_text
+    peer = _peer()
+    window.service.events.put(("roster", (peer,)))
+    window.drain()
+    window.peer_list.setCurrentIndex(window.peer_table_model.index(0, 0))
+    session_id = peer.hello.session_id
+
+    def check(expected_key: str) -> None:
+        record = window.service.peer_repository.get(session_id)
+        assert record is not None
+        assert peer_state(record) == expected_key
+        nearby_rows = [item for item in window.peer_model.records
+                       if item.session_id == session_id]
+        if record.nearby:
+            assert len(nearby_rows) == 1
+            assert peer_state(nearby_rows[0]) == expected_key
+        assert window.overview_state_pill.state() == expected_key
+        assert window.overview_peer_state.text() == (
+            f"{pill_display_text(expected_key)} · Unverified")
+
+    check("nearby")
+    window.service.peer_repository.register_probe(
+        "phase-tcp", session_id, peer.ip, peer.hello.tcp_port, "tcp")
+    window.service.events.put(("diagnostic_result", ProbeResult(
+        "phase-tcp", "tcp", peer.ip, peer.hello.tcp_port,
+        "reachable", 4.0, "", 2.0)))
+    window.drain()
+    check("reachable")
+    window.service.peer_repository.register_probe(
+        "phase-echo", session_id, peer.ip, peer.hello.tcp_port, "echo")
+    window.service.events.put(("diagnostic_result", ProbeResult(
+        "phase-echo", "echo", peer.ip, peer.hello.tcp_port,
+        "compatible", 5.0, "", 3.0)))
+    window.drain()
+    check("compatible")
+    window.service.events.put(("roster", ()))
+    window.drain()
+    check("offline")
+    assert window.peer_selection.session_id == session_id
 
 
 def test_roster_updates_peer_model_and_capability_actions(window: object) -> None:
