@@ -196,3 +196,70 @@ def test_stale_history_is_bounded_without_dropping_nearby_records() -> None:
     snapshot = repository.snapshot()
     assert peers[2].hello.session_id in {record.session_id for record in snapshot}
     assert len(snapshot) == 2
+
+
+def test_measured_rtt_sets_latency_with_source_without_invention() -> None:
+    repository = PeerRepository()
+    peer = _peer()
+    repository.reconcile_presence((peer,), 10)
+    repository.register_probe("ping", peer.hello.session_id, peer.ip, None, "ping")
+    event = repository.apply_probe_result(ProbeResult(
+        "ping", "ping", peer.ip, None, "reachable", 5.0, "reply", 1.2))
+    assert event is not None
+    record = repository.get(peer.hello.session_id)
+    assert record.latency_ms == 1.2
+    assert record.latency_source == "ping"
+
+    repository.register_probe("tcp", peer.hello.session_id, peer.ip,
+                              peer.hello.tcp_port, "tcp")
+    repository.apply_probe_result(ProbeResult(
+        "tcp", "tcp", peer.ip, peer.hello.tcp_port, "timed_out", 50.0))
+    assert repository.get(peer.hello.session_id).latency_ms == 1.2
+
+
+def test_invalid_or_missing_rtt_leaves_latency_unknown() -> None:
+    repository = PeerRepository()
+    peer = _peer()
+    repository.reconcile_presence((peer,), 10)
+    repository.register_probe("ping", peer.hello.session_id, peer.ip, None, "ping")
+    repository.apply_probe_result(ProbeResult(
+        "ping", "ping", peer.ip, None, "reachable", 5.0, "reply", None))
+    assert repository.get(peer.hello.session_id).latency_ms is None
+    repository.register_probe("bad", peer.hello.session_id, peer.ip, None, "ping")
+    repository.apply_probe_result(ProbeResult(
+        "bad", "ping", peer.ip, None, "reachable", 5.0, "reply", float("inf")))
+    assert repository.get(peer.hello.session_id).latency_ms is None
+
+
+def test_endpoint_change_clears_measured_latency() -> None:
+    repository = PeerRepository()
+    peer = _peer()
+    repository.reconcile_presence((peer,), 10)
+    repository.register_probe("ping", peer.hello.session_id, peer.ip, None, "ping")
+    repository.apply_probe_result(ProbeResult(
+        "ping", "ping", peer.ip, None, "reachable", 5.0, "reply", 2.5))
+    moved = Peer(peer.hello, "192.168.1.99", 11)
+    repository.reconcile_presence((moved,), 11)
+    record = repository.get(peer.hello.session_id)
+    assert record.latency_ms is None
+    assert record.latency_source is None
+
+
+def test_overview_summary_uses_non_contradictory_counts_and_rtt() -> None:
+    repository = PeerRepository()
+    first, second, third = _peer("A"), _peer("B"), _peer("C")
+    repository.reconcile_presence((first, second, third), 10)
+    for identifier, peer, rtt in (("one", first, 1.0), ("two", second, 3.0)):
+        repository.register_probe(identifier, peer.hello.session_id, peer.ip,
+                                  peer.hello.tcp_port, "tcp")
+        repository.apply_probe_result(ProbeResult(
+            identifier, "tcp", peer.ip, peer.hello.tcp_port,
+            "reachable", rtt + 1.0, "", rtt))
+    repository.reconcile_presence((first, second), 11)
+    summary = repository.overview_summary()
+    assert (summary.observed, summary.nearby, summary.stale) == (3, 2, 1)
+    assert summary.responsive == 2
+    assert summary.measured == 2
+    assert summary.min_ms == 1.0
+    assert summary.max_ms == 3.0
+    assert summary.avg_ms == 2.0

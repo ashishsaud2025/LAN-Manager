@@ -63,6 +63,7 @@ class PeerRecord:
     mac_address: str | None = None
     mac_source: str | None = None
     latency_ms: float | None = None
+    latency_source: str | None = None
     services: tuple[str, ...] = ()
 
     @property
@@ -78,6 +79,20 @@ class PeerRecord:
     def as_peer(self) -> Peer:
         """Return the active transport shape used by existing services."""
         return Peer(self.hello, self.ip, self.last_seen)
+
+
+@dataclass(frozen=True)
+class OverviewSummary:
+    """Non-contradictory counts and measured RTT statistics."""
+
+    observed: int = 0
+    nearby: int = 0
+    stale: int = 0
+    responsive: int = 0
+    measured: int = 0
+    min_ms: float | None = None
+    avg_ms: float | None = None
+    max_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +163,7 @@ class PeerRepository:
                     mac_address=previous.mac_address if same_endpoint else None,
                     mac_source=previous.mac_source if same_endpoint else None,
                     latency_ms=previous.latency_ms if same_endpoint else None,
+                    latency_source=previous.latency_source if same_endpoint else None,
                     services=previous.services if same_endpoint else (),
                 )
             for session_id, record in tuple(self._records.items()):
@@ -201,27 +217,45 @@ class PeerRepository:
             before = dict(self._records)
             reachable = record.reachability_state
             compatible = record.compatibility_state
+            latency_ms = record.latency_ms
+            latency_source = record.latency_source
             if result.kind == "ping" and result.state == "reachable":
                 reachable = ReachabilityState.REACHABLE
+                if _valid_latency(result.rtt_ms):
+                    latency_ms = result.rtt_ms
+                    latency_source = "ping"
             elif result.kind == "tcp":
                 if result.state in {"reachable", "refused"}:
                     reachable = ReachabilityState.REACHABLE
+                    if _valid_latency(result.rtt_ms):
+                        latency_ms = result.rtt_ms
+                        latency_source = "tcp"
                 elif result.state in {"timed_out", "network_unreachable"}:
                     reachable = ReachabilityState.UNREACHABLE
             elif result.kind == "echo":
                 if result.state == "compatible":
                     reachable = ReachabilityState.REACHABLE
                     compatible = CompatibilityState.COMPATIBLE
+                    if _valid_latency(result.rtt_ms):
+                        latency_ms = result.rtt_ms
+                        latency_source = "echo"
                 elif result.state == "incompatible":
                     reachable = ReachabilityState.REACHABLE
                     compatible = CompatibilityState.INCOMPATIBLE
+                    if _valid_latency(result.rtt_ms):
+                        latency_ms = result.rtt_ms
+                        latency_source = "echo"
                 elif result.state == "refused":
                     reachable = ReachabilityState.REACHABLE
+                    if _valid_latency(result.rtt_ms):
+                        latency_ms = result.rtt_ms
+                        latency_source = "tcp"
                 elif result.state in {"timed_out", "network_unreachable"}:
                     reachable = ReachabilityState.UNREACHABLE
             self._records[pending.session_id] = replace(
                 record, reachability_state=reachable,
-                compatibility_state=compatible)
+                compatibility_state=compatible, latency_ms=latency_ms,
+                latency_source=latency_source)
             return self._event(before)
 
     def snapshot(self) -> tuple[PeerRecord, ...]:
@@ -244,6 +278,22 @@ class PeerRepository:
         """Return nearby records advertising one capability."""
         return tuple(record for record in self.nearby()
                      if capability in record.hello.capabilities)
+
+    def overview_summary(self) -> OverviewSummary:
+        """Return non-contradictory counts and measured RTT statistics."""
+        with self._lock:
+            records = self._snapshot()
+        nearby = [record for record in records if record.nearby]
+        stale = len(records) - len(nearby)
+        responsive = sum(1 for record in nearby
+                         if record.reachability_state is ReachabilityState.REACHABLE)
+        latencies = [record.latency_ms for record in nearby
+                     if _valid_latency(record.latency_ms)]
+        if not latencies:
+            return OverviewSummary(len(records), len(nearby), stale, responsive, 0)
+        return OverviewSummary(
+            len(records), len(nearby), stale, responsive, len(latencies),
+            min(latencies), sum(latencies) / len(latencies), max(latencies))
 
     def _purge_stale(self, now: float) -> None:
         expired = [session_id for session_id, record in self._records.items()
@@ -275,3 +325,9 @@ class PeerRepository:
         records = tuple(self._records.values())
         return (tuple(record for record in records if record.nearby)
                 + tuple(record for record in records if not record.nearby))
+
+
+def _valid_latency(value: float | int | None) -> bool:
+    """Return whether a latency sample can be presented as measured latency."""
+    return (isinstance(value, (float, int)) and not isinstance(value, bool)
+            and math.isfinite(float(value)) and 0 < float(value) < 60000)
