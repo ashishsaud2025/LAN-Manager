@@ -24,16 +24,8 @@ class NavigationRail(QFrame):
         self.setObjectName("Navigation")
         self.setFixedWidth(GEOMETRY["navigation"])
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(SPACING["lg"], SPACING["lg"],
-                                  SPACING["lg"], SPACING["lg"])
-        self.brand = QLabel("LAN ATLAS")
-        self.brand.setObjectName("Brand")
-        self.subtitle = QLabel("your local network workspace")
-        self.subtitle.setObjectName("BrandSubtle")
-        self.subtitle.setWordWrap(True)
-        layout.addWidget(self.brand)
-        layout.addWidget(self.subtitle)
-        layout.addSpacing(SPACING["lg"])
+        layout.setContentsMargins(SPACING["sm"], SPACING["md"],
+                                  SPACING["sm"], SPACING["md"])
         self.list = QListWidget()
         self.list.setObjectName("NavigationList")
         self.list.setAccessibleName("Primary navigation")
@@ -63,7 +55,6 @@ class NavigationRail(QFrame):
         width = (GEOMETRY["navigation_compact"] if compact
                  else GEOMETRY["navigation"])
         self.setFixedWidth(width)
-        self.subtitle.setVisible(not compact)
 
     def select(self, index: int) -> None:
         """Select a page from keyboard shortcuts or contextual actions."""

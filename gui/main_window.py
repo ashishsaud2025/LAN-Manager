@@ -24,13 +24,21 @@ from core.peer_repository import (
     ReachabilityState,
 )
 from core.roster import Peer
-from gui.components import NavigationRail, action_button, card, page_header
+from gui.components import NavigationRail, action_button, page_header
+from gui.pages.overview import (activity_log, inspector_row, metric_card,
+                                radar_map, refresh_distribution,
+                                state_pill_for, trust_pill)
+from gui.widgets.header_icon import header_icon
+from gui.widgets.mono_label import MonoLabel
+from gui.widgets.peer_row import PeerRowDelegate, pill_display_text
+from gui.widgets.segmented_bar import SegmentedBar
+from gui.widgets.sparkline import SparklineWidget
+from gui.widgets.top_bar import TopBar
 from gui.models import (
     ActivityEntry, ActivityListModel, AdminDevice, AdminDeviceListModel,
     MessageEntry, MessageListModel, PeerListModel, PeerTableModel, PostListModel,
     TransferListModel, capability_label,
 )
-from gui.latency_map import LatencyMap
 from gui.peer_selection import PeerSelection
 from gui.theme import GEOMETRY, SPACING, apply_theme
 from gui.topology import NetworkTopology
@@ -107,18 +115,22 @@ class MainWindow(QMainWindow):
     def _build_shell(self) -> None:
         root = QWidget(self)
         root.setObjectName("AppRoot")
-        outer = QHBoxLayout(root)
+        outer = QVBoxLayout(root)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+        outer.addWidget(self._build_status_strip())
+        middle = QWidget()
+        middle_layout = QHBoxLayout(middle)
+        middle_layout.setContentsMargins(0, 0, 0, 0)
+        middle_layout.setSpacing(0)
         self.navigation = NavigationRail(self.navigation_groups)
         self.navigation.selected.connect(self.select_page)
-        outer.addWidget(self.navigation)
+        middle_layout.addWidget(self.navigation)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
-        right_layout.addWidget(self._build_status_strip())
         workspace = QWidget()
         workspace_layout = QVBoxLayout(workspace)
         workspace_layout.setContentsMargins(SPACING["md"], SPACING["md"],
@@ -156,7 +168,8 @@ class MainWindow(QMainWindow):
         workspace_layout.addWidget(self.transfer_drawer)
         right_layout.addWidget(workspace, 1)
         right_layout.addWidget(self._build_footer())
-        outer.addWidget(right, 1)
+        middle_layout.addWidget(right, 1)
+        outer.addWidget(middle, 1)
         self.setCentralWidget(root)
 
     def _add_page(self, page: QWidget, compact_height: int) -> None:
@@ -168,38 +181,16 @@ class MainWindow(QMainWindow):
         self.responsive_pages.append((page, compact_height))
         self.stack.addWidget(scroll)
 
-    def _build_status_strip(self) -> QFrame:
-        frame = QFrame()
-        frame.setObjectName("ApplicationHeader")
-        frame.setFixedHeight(58)
-        layout = QHBoxLayout(frame)
-        layout.setContentsMargins(12, 7, 12, 7)
-        version = QLabel("v1\nlocal")
-        version.setObjectName("HeaderMetric")
-        self.identity_status = QLabel(
-            f"NODE · {self.service.hello.name}\n{self.service.hello.peer_id[:8]}")
-        self.identity_status.setObjectName("HeaderMetric")
-        self.nearby_status = QLabel("0 sessions nearby")
-        self.nearby_status.setObjectName("HeaderMetric")
-        self.network_status = QLabel("Network core configured")
-        self.network_status.setObjectName("HeaderMetric")
-        self.transfer_status = QLabel("0 active transfers")
-        self.transfer_status.setObjectName("HeaderMetric")
-        self.command_button = QPushButton("Commands  Ctrl+K")
-        self.command_button.setEnabled(False)
-        self.command_button.setToolTip("Command palette reserved for a later phase")
-        self.security_status = QPushButton("◇  Unverified LAN")
-        self.security_status.setProperty("security", True)
-        self.security_status.setToolTip(
-            "Peer names and IDs are self-reported. Traffic is not authenticated or encrypted.")
+    def _build_status_strip(self) -> TopBar:
+        bar = TopBar(self.service.hello.name, self.service.hello.peer_id[:8])
+        self.identity_status = bar.identity
+        self.nearby_status = bar.nearby
+        self.network_status = bar.network
+        self.transfer_status = bar.transfers
+        self.command_button = bar.command
+        self.security_status = bar.security
         self.security_status.clicked.connect(lambda: self.navigation.select(PAGE_SETTINGS))
-        for widget in (version, self.identity_status, self.nearby_status,
-                       self.network_status, self.transfer_status):
-            layout.addWidget(widget)
-        layout.addStretch(1)
-        layout.addWidget(self.command_button)
-        layout.addWidget(self.security_status)
-        return frame
+        return bar
 
     def _build_footer(self) -> QFrame:
         frame = QFrame()
@@ -246,17 +237,19 @@ class MainWindow(QMainWindow):
             "Local network overview",
             "Live observations from this LAN Manager session.", True)
         self.overview_metrics = QGridLayout()
-        nearby_card, self.nearby_value = card("Nearby sessions", "Searching...")
-        capability_card, self.capability_value = card("Advertised features", "Waiting")
-        transfer_card, self.transfer_value = card("Active transfers", "None")
-        identity_card, self.identity_value = card("This device", self.service.hello.name)
+        nearby_card, self.nearby_value = metric_card("Nearby sessions", "Searching...")
+        capability_card, self.capability_value = metric_card(
+            "Advertised features", "Waiting")
+        transfer_card, self.transfer_value = metric_card("Active transfers", "None")
+        identity_card, self.identity_value = metric_card(
+            "This device", self.service.hello.name)
         self.overview_metric_cards = (
             nearby_card, capability_card, transfer_card, identity_card)
-        self.identity_detail = QLabel(f"ID {self.service.hello.peer_id[:8]}")
+        self.identity_detail = MonoLabel(f"ID {self.service.hello.peer_id[:8]}")
         self.identity_detail.setObjectName("TechnicalDetail")
         identity_card.layout().addWidget(self.identity_detail)
-        for index, metric_card in enumerate(self.overview_metric_cards):
-            self.overview_metrics.addWidget(metric_card, index // 2, index % 2)
+        for index, metric_frame in enumerate(self.overview_metric_cards):
+            self.overview_metrics.addWidget(metric_frame, index // 2, index % 2)
 
         self.overview_splitter = QSplitter(Qt.Orientation.Horizontal)
         network = QFrame()
@@ -264,8 +257,11 @@ class MainWindow(QMainWindow):
         network_layout = QVBoxLayout(network)
         network_heading = QLabel("LATENCY MAP (OBSERVED RTT)")
         network_heading.setObjectName("SectionLabel")
-        network_layout.addWidget(network_heading)
-        self.overview_topology = LatencyMap(self.service.hello, self.theme_mode)
+        network_title = QHBoxLayout()
+        network_title.addWidget(header_icon("hub"))
+        network_title.addWidget(network_heading, 1)
+        network_layout.addLayout(network_title)
+        self.overview_topology = radar_map(self.service.hello, self.theme_mode)
         self.overview_topology.device_selected.connect(self._overview_map_selected)
         network_layout.addWidget(self.overview_topology, 1)
         self.overview_splitter.addWidget(network)
@@ -275,13 +271,20 @@ class MainWindow(QMainWindow):
         metrics_layout = QVBoxLayout(metrics_panel)
         metrics_heading = QLabel("LATENCY & METRICS")
         metrics_heading.setObjectName("PanelTitle")
-        metrics_layout.addWidget(metrics_heading)
+        metrics_title = QHBoxLayout()
+        metrics_title.addWidget(header_icon("stats"))
+        metrics_title.addWidget(metrics_heading, 1)
+        metrics_layout.addLayout(metrics_title)
         metrics_layout.addLayout(self.overview_metrics)
-        self.overview_summary = QLabel("Searching your LAN for observed hosts...")
+        self.overview_breakdown = SegmentedBar()
+        metrics_layout.addWidget(self.overview_breakdown)
+        self.overview_sparkline = SparklineWidget()
+        metrics_layout.addWidget(self.overview_sparkline)
+        self.overview_summary = MonoLabel("Searching your LAN for observed hosts...")
         self.overview_summary.setObjectName("TechnicalDetail")
         self.overview_summary.setWordWrap(True)
         metrics_layout.addWidget(self.overview_summary)
-        self.overview_rtt = QLabel("Measured latency: none yet")
+        self.overview_rtt = MonoLabel("Measured latency: none yet")
         self.overview_rtt.setObjectName("TechnicalDetail")
         self.overview_rtt.setWordWrap(True)
         metrics_layout.addWidget(self.overview_rtt)
@@ -305,7 +308,10 @@ class MainWindow(QMainWindow):
         nearby_layout = QVBoxLayout(nearby)
         nearby_heading = QLabel("NEARBY")
         nearby_heading.setObjectName("SectionLabel")
-        nearby_layout.addWidget(nearby_heading)
+        nearby_title = QHBoxLayout()
+        nearby_title.addWidget(header_icon("table"))
+        nearby_title.addWidget(nearby_heading, 1)
+        nearby_layout.addLayout(nearby_title)
         self.overview_nearby_stack = QStackedWidget()
         self.overview_nearby_empty = QLabel(
             "Searching your LAN...\nNearby sessions will appear after a HELLO announcement.")
@@ -314,6 +320,7 @@ class MainWindow(QMainWindow):
         self.overview_nearby_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.overview_peer_list = QListView()
         self.overview_peer_list.setModel(self.peer_model)
+        self.overview_peer_list.setItemDelegate(PeerRowDelegate(self))
         self.overview_peer_list.setAccessibleName("Overview nearby sessions")
         self.overview_peer_list.setWordWrap(True)
         self.overview_peer_list.setHorizontalScrollBarPolicy(
@@ -330,26 +337,40 @@ class MainWindow(QMainWindow):
         inspector_layout = QVBoxLayout(overview_inspector)
         inspector_heading = QLabel("SELECTED SESSION")
         inspector_heading.setObjectName("SectionLabel")
+        inspector_title = QHBoxLayout()
+        inspector_title.addWidget(header_icon("inspector"))
+        inspector_title.addWidget(inspector_heading, 1)
         self.overview_peer_name = QLabel("No session selected")
         self.overview_peer_name.setObjectName("PanelTitle")
-        self.overview_peer_detail = QLabel(
-            "Select an observed session to inspect its reported identity and capabilities.")
-        self.overview_peer_detail.setObjectName("TechnicalDetail")
-        self.overview_peer_detail.setWordWrap(True)
+        endpoint_row, self.overview_peer_endpoint = inspector_row("IP Endpoint:")
+        installation_row, self.overview_peer_installation = inspector_row(
+            "Installation:")
+        session_row, self.overview_peer_session = inspector_row("Session:")
+        state_row, self.overview_peer_state = inspector_row("State:")
         self.overview_peer_caps = QLabel("Presence only")
         self.overview_peer_caps.setProperty("chip", True)
-        self.overview_peer_rtt = QLabel("Measured latency: none yet")
+        self.overview_peer_rtt = MonoLabel("Measured latency: none yet")
         self.overview_peer_rtt.setObjectName("TechnicalDetail")
         self.overview_peer_rtt.setWordWrap(True)
-        overview_trust = QLabel("◇  Cryptographic trust: Unverified")
-        overview_trust.setProperty("warning", True)
-        overview_trust.setWordWrap(True)
-        inspector_layout.addWidget(inspector_heading)
+        self.overview_state_pill = state_pill_for(None)
+        self.overview_state_pill.setText("No selection")
+        self.overview_trust_pill = trust_pill()
+        self.overview_trust_pill.setText("◇  Unverified")
+        self.overview_trust_pill.setToolTip(
+            "No authenticated device identity has been established.")
+        pill_row = QHBoxLayout()
+        pill_row.addWidget(self.overview_state_pill)
+        pill_row.addWidget(self.overview_trust_pill)
+        pill_row.addStretch(1)
+        inspector_layout.addLayout(inspector_title)
         inspector_layout.addWidget(self.overview_peer_name)
-        inspector_layout.addWidget(self.overview_peer_detail)
+        inspector_layout.addWidget(endpoint_row)
+        inspector_layout.addWidget(installation_row)
+        inspector_layout.addWidget(session_row)
+        inspector_layout.addWidget(state_row)
         inspector_layout.addWidget(self.overview_peer_caps)
         inspector_layout.addWidget(self.overview_peer_rtt)
-        inspector_layout.addWidget(overview_trust)
+        inspector_layout.addLayout(pill_row)
         inspector_layout.addStretch(1)
         inspector_layout.addWidget(action_button(
             "Open full device inspector", lambda: self.navigation.select(PAGE_DEVICES), True))
@@ -361,28 +382,11 @@ class MainWindow(QMainWindow):
         activity = QFrame()
         activity.setProperty("panel", True)
         activity_layout = QVBoxLayout(activity)
-        activity_header = QHBoxLayout()
-        activity_heading = QLabel("RECENT ACTIVITY")
-        activity_heading.setObjectName("SectionLabel")
-        activity_header.addWidget(activity_heading)
-        activity_header.addStretch(1)
-        activity_header.addWidget(action_button(
-            "View activity", lambda: self.navigation.select(PAGE_ACTIVITY)))
-        activity_layout.addLayout(activity_header)
-        self.overview_activity_stack = QStackedWidget()
-        self.overview_activity_empty = QLabel("No operational activity yet")
-        self.overview_activity_empty.setObjectName("PageSubtitle")
-        self.overview_activity_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.overview_activity_view = QListView()
-        self.overview_activity_view.setModel(self.activity_model)
-        self.overview_activity_view.setAccessibleName("Recent operational activity")
-        self.overview_activity_view.setWordWrap(True)
-        self.overview_activity_view.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.overview_activity_stack.addWidget(self.overview_activity_empty)
-        self.overview_activity_stack.addWidget(self.overview_activity_view)
-        self.overview_activity_stack.setMaximumHeight(150)
-        activity_layout.addWidget(self.overview_activity_stack)
+        self.overview_activity_log = activity_log(self.activity_model)
+        self.overview_activity_stack = self.overview_activity_log.stack
+        self.overview_activity_empty = self.overview_activity_log.empty
+        self.overview_activity_view = self.overview_activity_log.view
+        activity_layout.addWidget(self.overview_activity_log)
         layout.addWidget(activity)
 
         self.status_help_button = QPushButton("How status works")
@@ -1394,6 +1398,8 @@ class MainWindow(QMainWindow):
             else:
                 self.overview_rtt.setText(
                     "Measured latency: none yet — run Ping, TCP, or ECHO")
+        refresh_distribution(self.overview_sparkline, self.overview_breakdown,
+                             nearby, summary)
         if len(nearby) != previous_count:
             self.append(f"Nearby roster now contains {len(nearby)} active session(s).",
                         "Discovery")
@@ -1446,12 +1452,19 @@ class MainWindow(QMainWindow):
         self._show_peer(record)
         self.topology.select_session(selected)
         self.overview_topology.select_session(selected)
+        pill = state_pill_for(record)
+        self.overview_state_pill.set_state(pill.state())
         if record is None:
             self.overview_peer_name.setText("No session selected")
-            self.overview_peer_detail.setText(
-                "Select a retained session to inspect known endpoint evidence.")
+            for value in (self.overview_peer_endpoint,
+                          self.overview_peer_installation,
+                          self.overview_peer_session):
+                value.setText("—")
+                value.setToolTip("")
+            self.overview_peer_state.setText("No session selected")
             self.overview_peer_caps.setText("Presence only")
             self.overview_peer_rtt.setText("Measured latency: none yet")
+            self.overview_state_pill.setText("No selection")
             self.network_selected_name.setText("No session selected")
             self.network_selected_detail.setText(
                 "Choose a node to inspect its observed endpoint and HELLO capabilities.")
@@ -1460,11 +1473,17 @@ class MainWindow(QMainWindow):
         state = "Nearby" if record.nearby else "Offline / stale"
         labels = [capability_label(item) for item in record.hello.capabilities]
         self.overview_peer_name.setText(record.hello.name)
-        self.overview_peer_detail.setText(
-            f"{record.ip}:{record.hello.tcp_port}\n"
-            f"Installation {record.hello.peer_id[:12]}…\n"
-            f"Session {record.session_id[:12]}…\n{state} · Unverified")
+        self.overview_peer_endpoint.setText(
+            f"{record.ip}:{record.hello.tcp_port}")
+        self.overview_peer_endpoint.setToolTip(
+            f"{record.ip}:{record.hello.tcp_port}")
+        self.overview_peer_installation.setText(f"{record.hello.peer_id[:12]}…")
+        self.overview_peer_installation.setToolTip(record.hello.peer_id)
+        self.overview_peer_session.setText(f"{record.session_id[:12]}…")
+        self.overview_peer_session.setToolTip(record.session_id)
+        self.overview_peer_state.setText(f"{pill_display_text(pill.state())} · Unverified")
         self.overview_peer_caps.setText("  ·  ".join(labels) or "Presence only")
+        self.overview_state_pill.setText(pill.text())
         if record.latency_ms is None:
             self.overview_peer_rtt.setText("Measured latency: none yet")
         else:
