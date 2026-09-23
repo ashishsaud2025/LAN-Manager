@@ -5,10 +5,11 @@ from __future__ import annotations
 import hashlib
 import math
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QResizeEvent
 from PySide6.QtWidgets import (
-    QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel, QVBoxLayout, QWidget,
+    QGraphicsItem, QGraphicsItemGroup, QGraphicsRectItem, QGraphicsScene,
+    QGraphicsView, QLabel, QVBoxLayout, QWidget,
 )
 
 from core.discovery import Hello
@@ -17,6 +18,10 @@ from gui.latency_map import RING_RTSS, radius_for_latency
 from gui.theme.tokens import COLORS
 
 HIGH_LATENCY_MS = 25.0
+_LABEL_PASSES = 24
+_LABEL_STEP = 12.0
+PlacedNode = tuple[QGraphicsItemGroup, list[QGraphicsItem], float, float,
+                   bool]
 
 
 def _angle_for(session_id: str) -> float:
@@ -89,8 +94,9 @@ class RadarMapWidget(QWidget):
             x = center_x + radius * math.cos(angle)
             y = center_y + radius * math.sin(angle)
             self.scene.addLine(center_x, center_y, x, y, edge_pen)
-        self._add_node(center_x, center_y, self.local.name,
-                       f"This device\n:{self.local.tcp_port}", "", True, None)
+        placed = [self._add_node(center_x, center_y, self.local.name,
+                                   f"This device\n:{self.local.tcp_port}", "",
+                                   True, None)]
         for record in records:
             angle = _angle_for(record.session_id)
             radius = radius_for_latency(record.latency_ms)
@@ -102,8 +108,9 @@ class RadarMapWidget(QWidget):
             else:
                 source = record.latency_source or "measured"
                 detail = f"{endpoint}\n{record.latency_ms:.1f} ms via {source}"
-            self._add_node(x, y, record.hello.name, detail,
-                           record.session_id, False, record)
+            placed.append(self._add_node(x, y, record.hello.name, detail,
+                                         record.session_id, False, record))
+        self._separate_labels(placed)
         if not records:
             text = self.scene.addText("Searching your LAN...")
             text.setDefaultTextColor(QColor(COLORS["on-surface-variant"]))
@@ -130,9 +137,68 @@ class RadarMapWidget(QWidget):
             return QPen(QColor(COLORS["tertiary"]), 2.0)
         return QPen(QColor(COLORS["primary"]), 2.0)
 
+    def _separate_labels(
+            self, placed: list[PlacedNode]) -> None:
+        """Nudge colliding label cards apart while dots stay hashed."""
+        bounds = self.scene.sceneRect()
+        drift: list[QPointF] = [QPointF(0.0, 0.0) for _ in placed]
+        for _ in range(_LABEL_PASSES):
+            moved = False
+            order = range(len(placed))
+            for first in order:
+                for second in order:
+                    if second <= first:
+                        continue
+                    mover = second if not placed[second][4] else first
+                    if placed[mover][4]:
+                        continue
+                    mover_rect = placed[mover][1][0].sceneBoundingRect()
+                    other = placed[first if mover == second else second][1][0]
+                    other_rect = other.sceneBoundingRect()
+                    if not mover_rect.intersects(other_rect):
+                        continue
+                    _, _, node_x, node_y, _ = placed[mover]
+                    radial = QPointF(node_x - 450.0, node_y - 260.0)
+                    length = math.hypot(radial.x(), radial.y())
+                    tangent = (QPointF(1.0, 0.0) if length < 1.0
+                               else QPointF(-radial.y() / length,
+                                            radial.x() / length))
+                    away = mover_rect.center() - other_rect.center()
+                    direction = (1.0 if away.x() * tangent.x()
+                                 + away.y() * tangent.y() >= 0.0 else -1.0)
+                    step = tangent * (direction * _LABEL_STEP)
+                    for child in placed[mover][1]:
+                        child.setPos(child.pos() + step)
+                    drift[mover] = drift[mover] + step
+                    moved = True
+            if not moved:
+                break
+        for index, (group, parts, _, _, local) in enumerate(placed):
+            if local:
+                continue
+            rect = parts[0].sceneBoundingRect()
+            shift = QPointF(min(max(0.0, 2.0 - rect.left()), 0.0),
+                            min(max(0.0, 2.0 - rect.top()), 0.0))
+            if rect.right() > bounds.right() - 2.0:
+                shift.setX(bounds.right() - 2.0 - rect.right())
+            if rect.bottom() > bounds.bottom() - 2.0:
+                shift.setY(bounds.bottom() - 2.0 - rect.bottom())
+            if not shift.isNull():
+                for child in parts:
+                    child.setPos(child.pos() + shift)
+                drift[index] = drift[index] + shift
+            if drift[index].manhattanLength() > 1.0:
+                center = group.pos()
+                label_center = parts[0].sceneBoundingRect().center()
+                link = self.scene.addLine(
+                    center.x(), center.y(), label_center.x(),
+                    label_center.y(),
+                    QPen(QColor(COLORS["surface-container-highest"]), 1.0))
+                link.setZValue(-0.5)
+
     def _add_node(self, x: float, y: float, title: str, detail: str,
                   session_id: str, local: bool,
-                  record: PeerRecord | None) -> None:
+                  record: PeerRecord | None) -> PlacedNode:
         diameter = 52.0 if local else 38.0
         if local:
             fill = QColor(COLORS["primary"])
@@ -162,6 +228,7 @@ class RadarMapWidget(QWidget):
             QPen(QColor(COLORS["surface-container-highest"]), 1),
             QBrush(QColor(COLORS["surface-container"])))
         label.setZValue(-1)
+        label.setData(1, "node-label")
         group = self.scene.createItemGroup([ellipse, label, title_item, detail_item])
         group.setPos(x, y)
         group.setData(0, session_id)
@@ -171,6 +238,7 @@ class RadarMapWidget(QWidget):
             group.setToolTip(f"{record.hello.name} at {record.ip}")
         elif session_id:
             group.setToolTip(title)
+        return group, [label, title_item, detail_item], x, y, local
 
     def select_session(self, session_id: str | None) -> bool:
         """Select a radar node by session without emitting navigation."""

@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QLabel
 
 from gui.theme.tokens import COLORS
 
-_VALID_KINDS = ("hub", "stats", "table", "inspector", "activity")
+_VALID_KINDS = ("hub", "stats", "table", "inspector", "activity", "radar")
 
 
 def header_icon(kind: str) -> QLabel:
@@ -35,6 +35,8 @@ def header_icon(kind: str) -> QLabel:
         _table(painter)
     elif kind == "inspector":
         _inspector(painter)
+    elif kind == "radar":
+        _radar(painter)
     else:
         _activity(painter)
     painter.end()
@@ -78,6 +80,13 @@ def _inspector(painter: QPainter) -> None:
     """Draw a neutral person glyph that claims no device type."""
     painter.drawEllipse(QPointF(9, 5.8), 2.3, 2.3)
     painter.drawArc(3, 8, 12, 9, 25 * 16, 130 * 16)
+
+
+def _radar(painter: QPainter) -> None:
+    """Draw a ring with a sweep for the network mode control."""
+    painter.drawEllipse(QPointF(9, 9), 6, 6)
+    painter.drawEllipse(QPointF(9, 9), 1.5, 1.5)
+    painter.drawLine(QPointF(9, 9), QPointF(13.5, 4.5))
 
 
 def _activity(painter: QPainter) -> None:

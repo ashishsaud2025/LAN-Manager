@@ -8,8 +8,10 @@ import time
 from typing import Any
 
 from PySide6.QtCore import QAbstractListModel, QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtGui import QFont
 
 from core.peer_repository import PeerRecord
+from gui.theme.fonts import mono_family
 
 
 @dataclass(frozen=True)
@@ -172,6 +174,8 @@ class PeerTableModel(QAbstractTableModel):
         peer = self.records[index.row()]
         if role == self.PeerRole:
             return peer
+        if role == Qt.ItemDataRole.FontRole and index.column() == 1:
+            return QFont(mono_family())
         if role == Qt.ItemDataRole.DisplayRole:
             age = max(0.0, time.monotonic() - peer.last_seen)
             values = (
