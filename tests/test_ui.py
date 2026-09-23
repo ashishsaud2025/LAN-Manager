@@ -266,8 +266,9 @@ def test_network_selection_updates_evidence_hud(window: object) -> None:
     window.drain()
     window._network_peer_selected(peer.hello.session_id)
     assert window.network_selected_name.text() == peer.hello.name
-    assert peer.ip in window.network_selected_detail.text()
-    assert "Unverified" in window.network_selected_detail.text()
+    assert peer.ip in window.network_selected_endpoint.text()
+    assert window.network_selected_session.toolTip() == peer.hello.session_id
+    assert "Unverified" in window.network_selected_state.text()
     assert window.network_observed_value.text() == "1"
 
 
@@ -303,13 +304,16 @@ def test_device_filters_use_canonical_evidence_states(window: object) -> None:
     window.service.events.put(("roster", (first,)))
     window.drain()
 
-    assert [window.device_filter.itemData(index)
-            for index in range(window.device_filter.count())] == [
-                "all", "nearby", "reachable", "compatible", "stale"]
-    window.device_filter.setCurrentIndex(window.device_filter.findData("compatible"))
+    assert set(window.device_tabs) == {
+        "all", "nearby", "reachable", "compatible", "stale"}
+    assert window.device_tabs["all"].text() == "All (2)"
+    assert window.device_tabs["nearby"].text() == "Nearby (1)"
+    assert window.device_tabs["compatible"].text() == "Compatible (1)"
+    assert window.device_tabs["stale"].text() == "Offline (1)"
+    window.device_tabs["compatible"].setChecked(True)
     assert not window.peer_list.isRowHidden(0)
     assert window.peer_list.isRowHidden(1)
-    window.device_filter.setCurrentIndex(window.device_filter.findData("stale"))
+    window.device_tabs["stale"].setChecked(True)
     assert window.peer_list.isRowHidden(0)
     assert not window.peer_list.isRowHidden(1)
 

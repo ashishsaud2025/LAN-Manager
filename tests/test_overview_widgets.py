@@ -113,6 +113,48 @@ def test_radar_map_click_emits_session_id(app: object) -> None:
     assert received == [peer.session_id]  # type: ignore[attr-defined]
 
 
+def test_radar_separates_colliding_labels_and_keeps_dots(app: object) -> None:
+    import math
+    from gui.widgets.radar_map import RadarMapWidget, _angle_for
+    from gui.latency_map import radius_for_latency
+    candidates = [f"overlap-fixture-{index:04d}" for index in range(300)]
+    angles = sorted(((abs((_angle_for(a) - _angle_for(b) + math.pi)
+                           % (2 * math.pi) - math.pi), a, b)
+                     for x, a in enumerate(candidates)
+                     for b in candidates[x + 1:]))
+    gap, first_id, second_id = angles[0]
+    assert gap < 0.3
+    third_id = next(item for item in candidates
+                    if item not in (first_id, second_id))
+    from core.peer_repository import PeerRecord
+    renamed = tuple(
+        PeerRecord(Hello(str(uuid4()), session_id, name, 50001, ("chat_v1",)),
+                   "192.168.1.20", 10.0)
+        for name, session_id in (("A", first_id), ("B", second_id),
+                                 ("C", third_id)))
+    local = Hello(str(uuid4()), str(uuid4()), "Local", 50001, ("chat_v1",))
+    radar = RadarMapWidget(local)
+    radar.set_records(renamed)
+    labels = [item for item in radar.scene.items()
+              if item.data(1) == "node-label"]
+    assert len(labels) == 4
+    bounds = radar.scene.sceneRect().adjusted(2, 2, -2, -2)
+    for index, first in enumerate(labels):
+        assert bounds.contains(first.sceneBoundingRect())
+        for second in labels[index + 1:]:
+            assert not first.sceneBoundingRect().intersects(
+                second.sceneBoundingRect())
+    dots = {item.data(0): item.pos() for item in radar.scene.items()
+            if isinstance(item.data(0), str) and item.data(0)}
+    for peer in renamed:
+        expected_x = 450.0 + radius_for_latency(None) * math.cos(
+            _angle_for(peer.session_id))
+        expected_y = 260.0 + radius_for_latency(None) * math.sin(
+            _angle_for(peer.session_id))
+        assert abs(dots[peer.session_id].x() - expected_x) < 0.01
+        assert abs(dots[peer.session_id].y() - expected_y) < 0.01
+
+
 def test_overview_helpers_map_only_known_states(app: object) -> None:
     from gui.pages.overview import (breakdown_segments, metric_card,
                                     sparkline_samples, state_pill_for, trust_pill)
