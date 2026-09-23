@@ -11,10 +11,10 @@ from typing import Any
 from PySide6.QtCore import QModelIndex, QSettings, Qt, QTimer, Slot
 from PySide6.QtGui import QCloseEvent, QKeySequence, QResizeEvent, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QListView, QMainWindow, QProgressBar,
-    QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget, QTableView,
-    QTextEdit, QVBoxLayout, QWidget,
+    QAbstractButton, QApplication, QComboBox, QFileDialog, QFrame, QGridLayout,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView, QMainWindow,
+    QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget,
+    QTableView, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from core.chat import ChatService
@@ -25,12 +25,15 @@ from core.peer_repository import (
 )
 from core.roster import Peer
 from gui.components import NavigationRail, action_button, page_header
+from gui.pages.devices import FILTER_TABS, filter_tabs, identity_block, tab_counts
+from gui.pages.network import hud_selected_block, metric_value, toolbar_title
 from gui.pages.overview import (activity_log, inspector_row, metric_card,
                                 radar_map, refresh_distribution,
                                 state_pill_for, trust_pill)
 from gui.widgets.header_icon import header_icon
 from gui.widgets.mono_label import MonoLabel
-from gui.widgets.peer_row import PeerRowDelegate, pill_display_text
+from gui.widgets.peer_row import (PeerRowDelegate, PeerTableDelegate,
+                                  pill_display_text)
 from gui.widgets.segmented_bar import SegmentedBar
 from gui.widgets.sparkline import SparklineWidget
 from gui.widgets.top_bar import TopBar
@@ -41,7 +44,6 @@ from gui.models import (
 )
 from gui.peer_selection import PeerSelection
 from gui.theme import GEOMETRY, SPACING, apply_theme
-from gui.topology import NetworkTopology
 
 PAGE_OVERVIEW = 0
 PAGE_NETWORK = 1
@@ -416,15 +418,13 @@ class MainWindow(QMainWindow):
         controls = QFrame()
         controls.setObjectName("OperationalToolbar")
         control_layout = QHBoxLayout(controls)
-        mode = QLabel("◎  OBSERVED MAP")
-        mode.setObjectName("PanelTitle")
-        self.network_toolbar_evidence = QLabel(
+        self.network_toolbar_evidence = MonoLabel(
             "HELLO edges  ·  Visual positions")
         self.network_toolbar_evidence.setObjectName("TechnicalDetail")
         fit_button = action_button("Fit", self._fit_topology)
         devices_button = action_button(
             "Devices", lambda: self.navigation.select(PAGE_DEVICES), True)
-        control_layout.addWidget(mode)
+        control_layout.addWidget(toolbar_title())
         control_layout.addSpacing(SPACING["md"])
         control_layout.addWidget(self.network_toolbar_evidence, 1)
         control_layout.addWidget(fit_button)
@@ -432,7 +432,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(controls)
 
         self.network_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.topology = NetworkTopology(self.service.hello, self.theme_mode)
+        self.topology = radar_map(self.service.hello, self.theme_mode)
         self.topology.device_selected.connect(self._network_peer_selected)
         self.network_splitter.addWidget(self.topology)
 
@@ -445,12 +445,10 @@ class MainWindow(QMainWindow):
         summary = QFrame()
         summary.setProperty("subpanel", True)
         summary_layout = QGridLayout(summary)
-        self.network_observed_value = QLabel("0")
-        self.network_observed_value.setObjectName("MetricValue")
-        self.network_capability_value = QLabel("0")
-        self.network_capability_value.setObjectName("MetricValue")
         summary_layout.addWidget(QLabel("Observed sessions"), 0, 0)
         summary_layout.addWidget(QLabel("Advertised features"), 0, 1)
+        self.network_observed_value = metric_value("0")
+        self.network_capability_value = metric_value("0")
         summary_layout.addWidget(self.network_observed_value, 1, 0)
         summary_layout.addWidget(self.network_capability_value, 1, 1)
         hud_layout.addWidget(summary)
@@ -458,15 +456,18 @@ class MainWindow(QMainWindow):
         selected_title.setObjectName("SectionLabel")
         self.network_selected_name = QLabel("No session selected")
         self.network_selected_name.setObjectName("PanelTitle")
-        self.network_selected_detail = QLabel(
-            "Choose a node to inspect its observed endpoint and HELLO capabilities.")
-        self.network_selected_detail.setObjectName("TechnicalDetail")
-        self.network_selected_detail.setWordWrap(True)
+        hud_rows, self.network_selected_endpoint, self.network_selected_session, \
+            self.network_selected_state, self.network_state_pill = hud_selected_block()
         self.network_selected_caps = QLabel("Presence only")
         self.network_selected_caps.setProperty("chip", True)
         hud_layout.addWidget(selected_title)
         hud_layout.addWidget(self.network_selected_name)
-        hud_layout.addWidget(self.network_selected_detail)
+        for hud_row in hud_rows:
+            hud_layout.addWidget(hud_row)
+        hud_pill_row = QHBoxLayout()
+        hud_pill_row.addWidget(self.network_state_pill)
+        hud_pill_row.addStretch(1)
+        hud_layout.addLayout(hud_pill_row)
         hud_layout.addWidget(self.network_selected_caps)
         legend_title = QLabel("EVIDENCE LEGEND")
         legend_title.setObjectName("SectionLabel")
@@ -497,21 +498,16 @@ class MainWindow(QMainWindow):
         self.device_search.setPlaceholderText("Filter by name, endpoint, session, capability...")
         self.device_search.setAccessibleName("Filter observed sessions")
         self.device_search.textChanged.connect(self._filter_devices)
-        self.device_filter = QComboBox()
-        self.device_filter.setAccessibleName("Device evidence filter")
-        for label, value in (
-                ("All", "all"), ("Nearby", "nearby"),
-                ("Reachable", "reachable"), ("Compatible", "compatible"),
-                ("Offline / stale", "stale")):
-            self.device_filter.addItem(label, value)
-        self.device_filter.currentIndexChanged.connect(
-            lambda _index: self._filter_devices(self.device_search.text()))
         self.device_scope = QLabel("No subnet scan · no inferred offline devices")
         self.device_scope.setObjectName("TechnicalDetail")
         toolbar_layout.addWidget(self.device_search, 1)
-        toolbar_layout.addWidget(self.device_filter)
         toolbar_layout.addWidget(self.device_scope)
         layout.addWidget(toolbar)
+        tab_row, self.device_tabs, self.device_tab_group = filter_tabs()
+        self._device_tab_key = "all"
+        self.device_tab_group.buttonToggled.connect(self._device_tab_toggled)
+        self._refresh_device_tab_counts(())
+        layout.addWidget(tab_row)
 
         self.peer_splitter = QSplitter(Qt.Orientation.Horizontal)
         table_panel = QFrame()
@@ -522,6 +518,8 @@ class MainWindow(QMainWindow):
         table_layout.addWidget(table_heading)
         self.peer_list = QTableView()
         self.peer_list.setModel(self.peer_table_model)
+        self.peer_list.setItemDelegateForColumn(
+            0, PeerTableDelegate(self.peer_list))
         self.peer_list.setAccessibleName("Nearby peer sessions")
         self.peer_list.setAlternatingRowColors(True)
         self.peer_list.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
@@ -551,13 +549,12 @@ class MainWindow(QMainWindow):
         self.peer_name.setObjectName("PanelTitle")
         self.peer_presence = QLabel("No peer selected")
         self.peer_presence.setObjectName("PageSubtitle")
+        self.peer_state_pill = state_pill_for(None)
+        self.peer_state_pill.setText("No selection")
         self.peer_endpoint = QLabel("Endpoint: —")
         self.peer_endpoint.setProperty("technical", True)
         self.peer_endpoint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.peer_identity = QLabel("Identity: —")
-        self.peer_identity.setProperty("technical", True)
-        self.peer_identity.setWordWrap(True)
-        self.peer_identity.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        identity_rows, self.peer_installation, self.peer_session = identity_block()
         self.peer_host = QLabel("Hostname: Not advertised")
         self.peer_platform = QLabel("Platform / architecture: Not advertised")
         self.peer_mac = QLabel("MAC address: Not observed")
@@ -597,15 +594,21 @@ class MainWindow(QMainWindow):
             button.setEnabled(False)
         details.addWidget(self.peer_name)
         details.addWidget(self.peer_presence)
+        peer_pill_row = QHBoxLayout()
+        peer_pill_row.addWidget(self.peer_state_pill)
+        peer_pill_row.addStretch(1)
+        details.addLayout(peer_pill_row)
         details.addSpacing(8)
         identity_panel = QFrame()
         identity_panel.setProperty("subpanel", True)
+        self.device_identity_panel = identity_panel
         identity_layout = QVBoxLayout(identity_panel)
         identity_title = QLabel("NETWORK & REPORTED IDENTITY")
         identity_title.setObjectName("SectionLabel")
         identity_layout.addWidget(identity_title)
         identity_layout.addWidget(self.peer_endpoint)
-        identity_layout.addWidget(self.peer_identity)
+        for identity_row in identity_rows:
+            identity_layout.addWidget(identity_row)
         identity_layout.addWidget(self.peer_host)
         identity_layout.addWidget(self.peer_platform)
         identity_layout.addWidget(self.peer_mac)
@@ -615,6 +618,7 @@ class MainWindow(QMainWindow):
         details.addWidget(self.peer_services)
         evidence_panel = QFrame()
         evidence_panel.setProperty("subpanel", True)
+        self.device_evidence_panel = evidence_panel
         evidence_layout = QVBoxLayout(evidence_panel)
         evidence_title = QLabel("CONNECTION EVIDENCE")
         evidence_title.setObjectName("SectionLabel")
@@ -640,6 +644,7 @@ class MainWindow(QMainWindow):
         self.peer_splitter.addWidget(inspector)
         self.peer_splitter.setSizes([720, 500])
         layout.addWidget(self.peer_splitter, 1)
+        self._show_peer(None)
         return page
 
     def _build_messages_page(self) -> QWidget:
@@ -1354,11 +1359,10 @@ class MainWindow(QMainWindow):
         feed_selected = self.feed_peer.currentData()
         self.peer_records = records
         nearby = tuple(record for record in records if record.nearby)
-        nearby_peers = tuple(record.as_peer() for record in nearby)
         self.peer_model.set_records(nearby)
         self.peer_table_model.set_records(records)
         self._rebuild_admin_devices()
-        self.topology.set_peers(nearby_peers)
+        self.topology.set_records(nearby)
         self.overview_topology.set_records(nearby)
         self.overview_nearby_stack.setCurrentWidget(
             self.overview_peer_list if nearby else self.overview_nearby_empty)
@@ -1370,6 +1374,8 @@ class MainWindow(QMainWindow):
         else:
             self._sync_peer_selection(self.peer_selection.session_id)
         self._filter_devices(self.device_search.text())
+        self._refresh_device_tab_counts(records)
+        self._show_peer(self._record_in_snapshot(self.peer_selection.session_id))
         self.nearby_status.setText(f"{len(nearby)} sessions nearby")
         self.network_status.setText("Discovery active · application listener configured")
         stale_count = len(records) - len(nearby)
@@ -1466,11 +1472,15 @@ class MainWindow(QMainWindow):
             self.overview_peer_rtt.setText("Measured latency: none yet")
             self.overview_state_pill.setText("No selection")
             self.network_selected_name.setText("No session selected")
-            self.network_selected_detail.setText(
-                "Choose a node to inspect its observed endpoint and HELLO capabilities.")
+            for value in (self.network_selected_endpoint,
+                          self.network_selected_session):
+                value.setText("—")
+                value.setToolTip("")
+            self.network_selected_state.setText("No session selected")
+            self.network_state_pill.set_state("offline")
+            self.network_state_pill.setText("No selection")
             self.network_selected_caps.setText("Presence only")
             return
-        state = "Nearby" if record.nearby else "Offline / stale"
         labels = [capability_label(item) for item in record.hello.capabilities]
         self.overview_peer_name.setText(record.hello.name)
         self.overview_peer_endpoint.setText(
@@ -1491,10 +1501,16 @@ class MainWindow(QMainWindow):
             self.overview_peer_rtt.setText(
                 f"Measured latency: {record.latency_ms:.1f} ms{source}")
         self.network_selected_name.setText(record.hello.name)
-        self.network_selected_detail.setText(
-            f"Observed endpoint  {record.ip}:{record.hello.tcp_port}\n"
-            f"Session  {record.session_id[:12]}…\n"
-            f"State  {state} · Unverified")
+        self.network_selected_endpoint.setText(
+            f"{record.ip}:{record.hello.tcp_port}")
+        self.network_selected_endpoint.setToolTip(
+            f"{record.ip}:{record.hello.tcp_port}")
+        self.network_selected_session.setText(f"{record.session_id[:12]}…")
+        self.network_selected_session.setToolTip(record.session_id)
+        self.network_selected_state.setText(
+            f"{pill_display_text(pill.state())} · Unverified")
+        self.network_state_pill.set_state(pill.state())
+        self.network_state_pill.setText(pill.text())
         self.network_selected_caps.setText("  ·  ".join(labels) or "Presence only")
 
     @Slot(QModelIndex, QModelIndex)
@@ -1509,8 +1525,17 @@ class MainWindow(QMainWindow):
         if record is None:
             self.peer_name.setText("Select a nearby session")
             self.peer_presence.setText("No peer selected")
+            self.peer_state_pill.set_state("offline")
+            self.peer_state_pill.setText("No selection")
             self.peer_endpoint.setText("Endpoint: —")
-            self.peer_identity.setText("Identity: —")
+            for value in (self.peer_installation, self.peer_session):
+                value.setText("—")
+                value.setToolTip("")
+            for widget in (self.device_identity_panel,
+                           self.device_evidence_panel,
+                           self.peer_capabilities, self.peer_services,
+                           self.peer_warning):
+                widget.setVisible(False)
             self.peer_host.setText("Hostname: Not advertised")
             self.peer_platform.setText("Platform / architecture: Not advertised")
             self.peer_mac.setText("MAC address: Not observed")
@@ -1532,9 +1557,18 @@ class MainWindow(QMainWindow):
         self.peer_presence.setText(f"{state} · last announcement {age:.1f} seconds ago")
         self.peer_endpoint.setText(
             f"Observed endpoint: {record.ip}:{record.hello.tcp_port}")
-        self.peer_identity.setText(
-            f"Installation {record.hello.peer_id[:12]}…\n"
-            f"Session {record.session_id[:12]}…")
+        self.peer_installation.setText(f"{record.hello.peer_id[:12]}…")
+        self.peer_installation.setToolTip(record.hello.peer_id)
+        self.peer_session.setText(f"{record.session_id[:12]}…")
+        self.peer_session.setToolTip(record.session_id)
+        device_pill = state_pill_for(record)
+        self.peer_state_pill.set_state(device_pill.state())
+        self.peer_state_pill.setText(device_pill.text())
+        for widget in (self.device_identity_panel,
+                       self.device_evidence_panel,
+                       self.peer_capabilities, self.peer_services,
+                       self.peer_warning):
+            widget.setVisible(True)
         self.peer_host.setText(f"Hostname: {record.hostname or 'Not advertised'}")
         platform = " / ".join(part for part in (record.platform, record.architecture)
                               if part)
@@ -1584,10 +1618,32 @@ class MainWindow(QMainWindow):
         return record.as_peer() if record is not None and record.nearby else None
 
     @Slot(str)
+    @Slot(QAbstractButton, bool)
+    def _device_tab_toggled(self, button: QAbstractButton,
+                            checked: bool) -> None:
+        """Apply the checked status tab through the shared filter path."""
+        for other in self.device_tab_group.buttons():
+            other.setProperty("active",
+                              "true" if other.isChecked() else "false")
+            other.style().unpolish(other)
+            other.style().polish(other)
+            other.update()
+        if checked:
+            self._device_tab_key = str(button.property("tab_key"))
+            self._filter_devices(self.device_search.text())
+
+    def _refresh_device_tab_counts(self,
+                                   records: tuple[PeerRecord, ...]) -> None:
+        """Update tab counts from the snapshot the table already shows."""
+        counts = tab_counts(records)
+        labels = dict(FILTER_TABS)
+        for key, button in self.device_tabs.items():
+            button.setText(f"{labels[key]} ({counts[key]})")
+
     def _filter_devices(self, text: str) -> None:
         """Filter only fields present in the HELLO observation."""
         query = text.strip().casefold()
-        evidence_filter = self.device_filter.currentData()
+        evidence_filter = self._device_tab_key
         for row, peer in enumerate(self.peer_table_model.records):
             labels = tuple(capability_label(item) for item in peer.hello.capabilities)
             values = " ".join((peer.hello.name, peer.ip, str(peer.hello.tcp_port),
