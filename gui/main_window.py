@@ -11,10 +11,11 @@ from typing import Any
 from PySide6.QtCore import QModelIndex, QSettings, Qt, QTimer, Slot
 from PySide6.QtGui import QCloseEvent, QKeySequence, QResizeEvent, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
-    QAbstractButton, QApplication, QComboBox, QFileDialog, QFrame, QGridLayout,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView, QMainWindow,
-    QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget,
-    QTableView, QTextEdit, QVBoxLayout, QWidget,
+    QAbstractButton, QApplication, QComboBox, QDoubleSpinBox, QFileDialog,
+    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QListView, QMainWindow, QProgressBar, QPushButton, QScrollArea, QSpinBox,
+    QSplitter, QStackedWidget, QTableView, QTabWidget, QTextEdit, QVBoxLayout,
+    QWidget,
 )
 
 from core.chat import ChatService
@@ -36,6 +37,7 @@ from gui.widgets.peer_row import (PeerRowDelegate, PeerTableDelegate,
                                   pill_display_text)
 from gui.widgets.segmented_bar import SegmentedBar
 from gui.widgets.sparkline import SparklineWidget
+from gui.widgets.status_pill import StatusPill
 from gui.widgets.top_bar import TopBar
 from gui.models import (
     ActivityEntry, ActivityListModel, AdminDevice, AdminDeviceListModel,
@@ -777,6 +779,105 @@ class MainWindow(QMainWindow):
         layout.addWidget(frame, 1)
         return page
 
+    def _stat_rows(self, parent: QVBoxLayout,
+                   titles: tuple[str, ...]) -> dict[str, MonoLabel]:
+        """Build muted-key plus mono-value rows for one tool result."""
+        stats: dict[str, MonoLabel] = {}
+        for title in titles:
+            row, value = inspector_row(title)
+            parent.addWidget(row)
+            stats[title] = value
+        return stats
+
+    def _build_ping_tab(self) -> tuple[QWidget, dict[str, QSpinBox | QDoubleSpinBox],
+                                       dict[str, MonoLabel], SparklineWidget,
+                                       StatusPill, QPushButton]:
+        """Build ping parameters, stats rows, and a sample sparkline."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        count = QSpinBox()
+        count.setRange(1, 10)
+        count.setValue(4)
+        count.setAccessibleName("Ping packet count")
+        timeout = QDoubleSpinBox()
+        timeout.setRange(0.5, 10.0)
+        timeout.setSingleStep(0.5)
+        timeout.setValue(3.0)
+        timeout.setSuffix(" s")
+        timeout.setAccessibleName("Ping per-packet timeout")
+        payload = QSpinBox()
+        payload.setRange(0, 1400)
+        payload.setValue(32)
+        payload.setSuffix(" B")
+        payload.setAccessibleName("Ping payload size")
+        for label, widget in (("Packets", count), ("Timeout", timeout),
+                              ("Payload", payload)):
+            row = QHBoxLayout()
+            name = QLabel(label)
+            name.setObjectName("MetricLabel")
+            row.addWidget(name)
+            row.addWidget(widget, 1)
+            layout.addLayout(row)
+        run = action_button("Ping selected", self._ping_admin_target, True)
+        layout.addWidget(run)
+        pill = StatusPill("Idle", "nearby")
+        layout.addWidget(pill)
+        stats = self._stat_rows(layout, ("Replies:", "Loss:", "Min RTT:",
+                                         "Avg RTT:", "Max RTT:", "Jitter:",
+                                         "TTL:"))
+        sparkline = SparklineWidget()
+        layout.addWidget(sparkline)
+        layout.addStretch(1)
+        return tab, {"count": count, "timeout": timeout,
+                     "payload": payload}, stats, sparkline, pill, run
+
+    def _build_tcp_tab(self) -> tuple[QWidget, dict[str, QSpinBox | QDoubleSpinBox],
+                                      dict[str, MonoLabel], StatusPill,
+                                      QPushButton]:
+        """Build TCP parameters and handshake result rows."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        timeout = QDoubleSpinBox()
+        timeout.setRange(0.5, 10.0)
+        timeout.setSingleStep(0.5)
+        timeout.setValue(3.0)
+        timeout.setSuffix(" s")
+        timeout.setAccessibleName("TCP per-attempt timeout")
+        attempts = QSpinBox()
+        attempts.setRange(1, 5)
+        attempts.setValue(1)
+        attempts.setAccessibleName("TCP attempts")
+        for label, widget in (("Timeout", timeout), ("Attempts", attempts)):
+            row = QHBoxLayout()
+            name = QLabel(label)
+            name.setObjectName("MetricLabel")
+            row.addWidget(name)
+            row.addWidget(widget, 1)
+            layout.addLayout(row)
+        run = action_button("Check TCP port", self._tcp_admin_target)
+        layout.addWidget(run)
+        pill = StatusPill("Idle", "nearby")
+        layout.addWidget(pill)
+        stats = self._stat_rows(layout, ("Connect time:", "Attempts:"))
+        layout.addStretch(1)
+        return tab, {"timeout": timeout, "attempts": attempts}, stats, pill, run
+
+    def _build_echo_tab(self) -> tuple[QWidget, dict[str, MonoLabel],
+                                       StatusPill, QPushButton]:
+        """Build ECHO identity, timing, and correlation rows."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        run = action_button("Check LAN Manager ECHO", self._echo_admin_target)
+        run.setToolTip("Available only for the selected session advertising echo_v1.")
+        run.setEnabled(False)
+        layout.addWidget(run)
+        pill = StatusPill("Idle", "nearby")
+        layout.addWidget(pill)
+        stats = self._stat_rows(layout, ("Correlation ID:", "Timing:",
+                                         "Reply:"))
+        layout.addStretch(1)
+        return tab, stats, pill, run
+
     def _build_admin_page(self) -> QWidget:
         page, layout = self._page(
             "Workbench",
@@ -866,21 +967,29 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.admin_address)
         control_layout.addWidget(port_label)
         control_layout.addWidget(self.admin_port)
-        actions = QGridLayout()
-        self.admin_ping_button = action_button("Ping selected", self._ping_admin_target, True)
-        self.admin_tcp_button = action_button("Check TCP port", self._tcp_admin_target)
-        self.admin_echo_button = action_button(
-            "Check LAN Manager ECHO", self._echo_admin_target)
-        self.admin_echo_button.setToolTip(
-            "Available only for the selected session advertising echo_v1.")
-        self.admin_echo_button.setEnabled(False)
+        self.admin_tabs = QTabWidget()
+        self.admin_tabs.setAccessibleName("Diagnostic tools")
+        ping_tab, self.ping_params, self.ping_stats, self.ping_sparkline, \
+            self.ping_pill, self.admin_ping_button = self._build_ping_tab()
+        self.admin_tabs.addTab(ping_tab, "Ping")
+        tcp_tab, self.tcp_params, self.tcp_stats, self.tcp_pill, \
+            self.admin_tcp_button = self._build_tcp_tab()
+        self.admin_tabs.addTab(tcp_tab, "TCP")
+        echo_tab, self.echo_stats, self.echo_pill, \
+            self.admin_echo_button = self._build_echo_tab()
+        self.admin_tabs.addTab(echo_tab, "ECHO")
+        for label in ("Raw TCP", "Traceroute", "Port Scan"):
+            planned = QLabel("Not implemented in this build.")
+            planned.setObjectName("PageSubtitle")
+            planned.setWordWrap(True)
+            planned.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            tab_index = self.admin_tabs.addTab(planned, label)
+            self.admin_tabs.setTabEnabled(tab_index, False)
+            self.admin_tabs.setTabToolTip(tab_index, "Not implemented in this build")
+        control_layout.addWidget(self.admin_tabs, 1)
         self.admin_cancel_button = action_button("Cancel current check", self._cancel_admin_probe)
         self.admin_cancel_button.setEnabled(False)
-        actions.addWidget(self.admin_ping_button, 0, 0)
-        actions.addWidget(self.admin_tcp_button, 0, 1)
-        actions.addWidget(self.admin_echo_button, 1, 0, 1, 2)
-        actions.addWidget(self.admin_cancel_button, 2, 0, 1, 2)
-        control_layout.addLayout(actions)
+        control_layout.addWidget(self.admin_cancel_button)
         self.admin_result = QLabel(
             "No check has run. Ping and TCP are separate evidence; failed ping does not prove "
             "that a TCP service is unavailable.")
@@ -891,7 +1000,6 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.admin_result)
         self.admin_address.textChanged.connect(self._update_admin_probe_buttons)
         self.admin_port.valueChanged.connect(self._update_admin_probe_buttons)
-        control_layout.addStretch(1)
         self.workbench_splitter.addWidget(controls)
         self.workbench_splitter.setSizes([560, 420])
         layout.addWidget(self.workbench_splitter, 1)
@@ -1089,14 +1197,32 @@ class MainWindow(QMainWindow):
     def _echo_admin_target(self) -> None:
         self._queue_admin_probe("echo")
 
+    def _probe_pill(self, kind: str, state: str, text: str) -> None:
+        """Reflect one probe state on its tab pill without new states."""
+        pill = {"ping": self.ping_pill, "tcp": self.tcp_pill,
+                "echo": self.echo_pill}[kind]
+        if state in {"reachable", "compatible", "refused"}:
+            pill_state = "reachable" if state != "compatible" else "compatible"
+        elif state == "running":
+            pill_state = "nearby"
+        else:
+            pill_state = "offline"
+        pill.set_state(pill_state)
+        pill.setText(text)
+
     def _queue_admin_probe(self, kind: str) -> None:
         address = self.admin_address.text().strip()
         try:
             if kind == "ping":
-                identifier = self.service.diagnostics.ping(address)
+                identifier = self.service.diagnostics.ping(
+                    address, count=self.ping_params["count"].value(),
+                    timeout=self.ping_params["timeout"].value(),
+                    payload_size=self.ping_params["payload"].value())
             elif kind == "tcp":
                 identifier = self.service.diagnostics.tcp_connect(
-                    address, self.admin_port.value())
+                    address, self.admin_port.value(),
+                    timeout=self.tcp_params["timeout"].value(),
+                    attempts=self.tcp_params["attempts"].value())
             else:
                 device = self._selected_admin_device()
                 record = self.service.peer_repository.get(
@@ -1132,6 +1258,7 @@ class MainWindow(QMainWindow):
         self.admin_ping_button.setEnabled(False)
         self.admin_tcp_button.setEnabled(False)
         self.admin_echo_button.setEnabled(False)
+        self._probe_pill(kind, "running", "Running")
         self.admin_result.setText(f"{kind.upper()} check queued for {address}")
 
     @Slot()
@@ -1232,7 +1359,45 @@ class MainWindow(QMainWindow):
         endpoint = (f"{result.address}:{result.port}"
                     if result.port is not None else result.address)
         self.admin_result.setText(f"Running {result.kind.upper()} check for {endpoint}...")
+        self._probe_pill(result.kind, "running", "Running")
         self.admin_cancel_button.setEnabled(True)
+
+    def _show_ping_stats(self, result: ProbeResult) -> None:
+        """Fill ping rows and sparkline from measured samples only."""
+        samples = result.rtt_samples
+        replies = len(samples)
+        self.ping_stats["Replies:"].setText(f"{replies}")
+        self.ping_stats["Loss:"].setText(
+            f"{result.loss_pct:.1f} %" if result.loss_pct is not None else "—")
+        self.ping_stats["Min RTT:"].setText(
+            f"{min(samples):.1f} ms" if samples else "—")
+        self.ping_stats["Avg RTT:"].setText(
+            f"{result.rtt_ms:.1f} ms" if result.rtt_ms is not None else "—")
+        self.ping_stats["Max RTT:"].setText(
+            f"{max(samples):.1f} ms" if samples else "—")
+        self.ping_stats["Jitter:"].setText(
+            f"{result.jitter_ms:.1f} ms" if result.jitter_ms is not None else "—")
+        self.ping_stats["TTL:"].setText(
+            str(result.ttl) if result.ttl is not None else "—")
+        self.ping_sparkline.set_samples(list(samples))
+
+    def _show_tcp_stats(self, result: ProbeResult) -> None:
+        """Fill TCP handshake rows without claiming packet captures."""
+        self.tcp_stats["Connect time:"].setText(
+            f"{result.rtt_ms:.1f} ms" if result.rtt_ms is not None else "—")
+        self.tcp_stats["Attempts:"].setText(result.detail or "—")
+
+    def _show_echo_stats(self, result: ProbeResult) -> None:
+        """Fill ECHO correlation rows from the validated exchange."""
+        self.echo_stats["Correlation ID:"].setText(result.request_id[:12] + "…")
+        self.echo_stats["Correlation ID:"].setToolTip(result.request_id)
+        timing = ""
+        if result.duration_ms is not None:
+            timing = f"{result.duration_ms:.1f} ms operation"
+        if result.rtt_ms is not None:
+            timing += f" · {result.rtt_ms:.1f} ms round-trip"
+        self.echo_stats["Timing:"].setText(timing or "—")
+        self.echo_stats["Reply:"].setText(result.detail or "—")
 
     def _show_probe_result(self, result: ProbeResult) -> None:
         endpoint = (f"{result.address}:{result.port}"
@@ -1249,6 +1414,13 @@ class MainWindow(QMainWindow):
             return
         self.active_probe_id = None
         self.admin_result.setText(text)
+        self._probe_pill(result.kind, result.state, result.state.title())
+        if result.kind == "ping":
+            self._show_ping_stats(result)
+        elif result.kind == "tcp":
+            self._show_tcp_stats(result)
+        else:
+            self._show_echo_stats(result)
         self.admin_cancel_button.setEnabled(False)
         self._update_admin_probe_buttons()
 

@@ -234,7 +234,9 @@ def test_admin_echo_uses_selected_advertised_session(
 def test_admin_probe_result_is_operational_activity(window: object,
                                                     monkeypatch: pytest.MonkeyPatch) -> None:
     identifier = str(uuid4())
-    monkeypatch.setattr(window.service.diagnostics, "ping", lambda address: identifier)
+    monkeypatch.setattr(
+        window.service.diagnostics, "ping",
+        lambda address, **kwargs: identifier)
     window.admin_address.setText("192.168.1.20")
     window._ping_admin_target()
     window.service.events.put(("diagnostic_started", ProbeResult(

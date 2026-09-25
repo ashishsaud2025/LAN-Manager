@@ -104,6 +104,25 @@ def build_stylesheet() -> str:
         QLineEdit:focus, QComboBox:focus {{
             border: 1px solid {COLORS["primary-container"]};
         }}
+        QTabWidget::pane {{
+            background: {COLORS["surface-container-low"]};
+            border: 1px solid {COLORS["surface-container"]};
+            border-radius: {RADIUS["DEFAULT"]}px;
+        }}
+        QTabBar::tab {{
+            background: {COLORS["surface-container"]};
+            color: {COLORS["on-surface-variant"]};
+            border: 1px solid {COLORS["surface-container"]};
+            border-radius: {RADIUS["sm"]}px;
+            padding: {SPACE["xs"]}px {SPACE["sm"]}px;
+        }}
+        QTabBar::tab:selected {{
+            color: {COLORS["primary"]};
+            border: 1px solid {COLORS["primary-container"]};
+        }}
+        QTabBar::tab:!enabled {{
+            color: {COLORS["outline"]};
+        }}
         QLabel#PulseDot {{
             background: {COLORS["primary"]};
             border-radius: 4px;
