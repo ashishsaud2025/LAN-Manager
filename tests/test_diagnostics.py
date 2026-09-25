@@ -96,6 +96,96 @@ def test_ping_failure_remains_separate_from_tcp_reachability() -> None:
     assert result.state == "no_reply"
 
 
+def test_ping_reports_samples_loss_and_jitter() -> None:
+    from core.diagnostics import (parse_ping_rtts, parse_ping_ttl,
+                                  ping_statistics)
+    output = ("Reply from 192.168.1.20: bytes=32 time=1ms TTL=128\n"
+              "Reply from 192.168.1.20: bytes=32 time=3ms TTL=128\n"
+              "Reply from 192.168.1.20: bytes=32 time=2ms TTL=128\n"
+              "Reply from 192.168.1.20: bytes=32 time=4ms TTL=128")
+    assert parse_ping_rtts(output) == (1.0, 3.0, 2.0, 4.0)
+    assert parse_ping_rtts(output, limit=2) == (1.0, 3.0)
+    assert parse_ping_ttl(output) == 128
+    assert parse_ping_ttl("no timing here") is None
+    assert ping_statistics(()) == (None, None, None, None)
+    minimum, average, maximum, jitter = ping_statistics((1.0, 3.0, 2.0, 4.0))
+    assert (minimum, average, maximum, jitter) == (1.0, 2.5, 4.0, 5 / 3)
+
+
+def test_multi_ping_command_shape_and_statistics() -> None:
+    events, emit = _events()
+    seen: list[tuple[list[str], float]] = []
+
+    def run(command: list[str], timeout: float) -> tuple[int, str, str]:
+        seen.append((command, timeout))
+        return 0, ("Reply from 192.168.1.20: bytes=32 time=2ms TTL=64\n"
+                   "Reply from 192.168.1.20: bytes=32 time=4ms TTL=64"), ""
+
+    service = DiagnosticsService(emit, platform="win32", command_runner=run)
+    service.start()
+    identifier = service.ping("192.168.1.20", count=4, payload_size=64)
+    assert events.get(timeout=2)[0] == "diagnostic_started"
+    kind, result = events.get(timeout=2)
+    service.stop()
+    assert service.join(2)
+    assert kind == "diagnostic_result"
+    assert result.request_id == identifier
+    assert result.state == "reachable"
+    assert seen[0][0][:6] == ["ping", "-n", "4", "-w", "3000", "-l"]
+    assert result.rtt_samples == (2.0, 4.0)
+    assert result.loss_pct == 50.0
+    assert result.rtt_ms == 3.0
+    assert result.jitter_ms == 2.0
+    assert result.ttl == 64
+
+
+def test_ping_and_tcp_parameters_are_bounded() -> None:
+    _, emit = _events()
+    service = DiagnosticsService(emit)
+    with pytest.raises(ValueError, match="count"):
+        service.ping("192.168.1.20", count=0)
+    with pytest.raises(ValueError, match="count"):
+        service.ping("192.168.1.20", count=11)
+    with pytest.raises(ValueError, match="timeout"):
+        service.ping("192.168.1.20", timeout=0.1)
+    with pytest.raises(ValueError, match="payload"):
+        service.ping("192.168.1.20", payload_size=1500)
+    with pytest.raises(ValueError, match="attempts"):
+        service.tcp_connect("192.168.1.20", 80, attempts=6)
+    with pytest.raises(ValueError, match="timeout"):
+        service.tcp_connect("192.168.1.20", 80, timeout=60.0)
+    service.stop()
+    assert service.join(1)
+
+
+def test_tcp_attempts_retry_until_first_success() -> None:
+    events, emit = _events()
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(2)
+
+        def accept() -> None:
+            conn, _ = listener.accept()
+            with conn:
+                pass
+
+        server = threading.Thread(target=accept, daemon=True)
+        server.start()
+        service = DiagnosticsService(emit)
+        service.start()
+        service.tcp_connect("127.0.0.1", listener.getsockname()[1],
+                            attempts=3)
+        assert events.get(timeout=2)[0] == "diagnostic_started"
+        kind, result = events.get(timeout=5)
+        service.stop()
+        assert service.join(2)
+        server.join(2)
+    assert kind == "diagnostic_result"
+    assert result.state == "reachable"
+    assert result.rtt_ms is not None
+
+
 def test_tcp_check_reports_success_without_sending_data() -> None:
     events, emit = _events()
     received = bytearray()
