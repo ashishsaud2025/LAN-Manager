@@ -7,7 +7,8 @@ from datetime import datetime
 import time
 from typing import Any
 
-from PySide6.QtCore import QAbstractListModel, QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtCore import (QAbstractListModel, QAbstractTableModel, QModelIndex,
+                            QObject, QSortFilterProxyModel, Qt)
 from PySide6.QtGui import QFont
 
 from core.peer_repository import PeerRecord
@@ -316,6 +317,64 @@ class TransferListModel(QAbstractListModel):
         index = self.index(row, 0)
         self.dataChanged.emit(index, index)
         return None
+
+
+def human_bytes(count: float) -> str:
+    """Format one byte count without implying false precision."""
+    value = max(0.0, float(count))
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024.0 or unit == "GiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} GiB"
+
+
+def transfer_pace(samples: tuple[tuple[float, float], ...], done: float,
+                  total: float) -> tuple[float | None, float | None]:
+    """Derive measured rate and ETA from event arrival samples only."""
+    if len(samples) < 2 or total <= 0 or done >= total:
+        return None, None
+    first_time, first_bytes = samples[0]
+    last_time, last_bytes = samples[-1]
+    elapsed = last_time - first_time
+    moved = last_bytes - first_bytes
+    if elapsed <= 0 or moved <= 0:
+        return None, None
+    rate = moved / elapsed
+    return rate, (total - done) / rate
+
+
+def format_eta(seconds: float | None) -> str:
+    """Format one ETA estimate with coarse honest granularity."""
+    if seconds is None:
+        return "unavailable"
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m {total % 60:02d}s"
+    return f"{total // 3600}h {(total % 3600) // 60:02d}m"
+
+
+class TerminalTransferProxy(QSortFilterProxyModel):
+    """Expose only finished transfers without duplicating model state."""
+
+    def __init__(self, terminal: frozenset[str],
+                 parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._terminal = terminal
+
+    def filterAcceptsRow(self, source_row: int,
+                         source_parent: QModelIndex) -> bool:
+        """Accept rows whose stored state reached a terminal phase."""
+        del source_parent
+        model = self.sourceModel()
+        if not isinstance(model, TransferListModel):
+            return True
+        if not 0 <= source_row < len(model.identifiers):
+            return False
+        return (model.rows[model.identifiers[source_row]].get("state")
+                in self._terminal)
 
 
 class PostListModel(QAbstractListModel):

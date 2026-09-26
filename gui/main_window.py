@@ -42,7 +42,8 @@ from gui.widgets.top_bar import TopBar
 from gui.models import (
     ActivityEntry, ActivityListModel, AdminDevice, AdminDeviceListModel,
     MessageEntry, MessageListModel, PeerListModel, PeerTableModel, PostListModel,
-    TransferListModel, capability_label,
+    TerminalTransferProxy, TransferListModel, capability_label, format_eta,
+    human_bytes, transfer_pace,
 )
 from gui.peer_selection import PeerSelection
 from gui.theme import GEOMETRY, SPACING, apply_theme
@@ -146,10 +147,7 @@ class MainWindow(QMainWindow):
         self._add_page(self._build_network_page(), 560)
         self._add_page(self._build_peers_page(), 680)
         self._add_page(self._build_admin_page(), 800)
-        self._add_page(self._build_placeholder_page(
-            "Files", "Shared-file catalog planned for the file-service phase.",
-            "Current file transfer remains available from Devices, Messages, and Transfers. "
-            "This page will list only explicitly published files."), 420)
+        self._add_page(self._build_files_page(), 420)
         self._add_page(self._build_transfers_page(), 560)
         self._add_page(self._build_messages_page(), 560)
         self._add_page(self._build_feed_page(), 560)
@@ -684,6 +682,35 @@ class MainWindow(QMainWindow):
         layout.addLayout(compose)
         return page
 
+    def _build_files_page(self) -> QWidget:
+        page, layout = self._page(
+            "Files", "Finished transfers kept on this device. Browsing peers' "
+            "files needs a request flow that is not implemented.")
+        self.files_proxy = TerminalTransferProxy(TERMINAL_TRANSFERS, self)
+        self.files_proxy.setSourceModel(self.transfer_model)
+        self.files_view = QListView()
+        self.files_view.setModel(self.files_proxy)
+        self.files_view.setAccessibleName("Finished transfer history")
+        self.files_view.setWordWrap(True)
+        self.files_view.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        layout.addWidget(self.files_view, 1)
+        self.files_count = QLabel("No finished transfers yet")
+        self.files_count.setObjectName("PageSubtitle")
+        layout.addWidget(self.files_count)
+        self.files_proxy.rowsInserted.connect(self._refresh_files_count)
+        self.files_proxy.rowsRemoved.connect(self._refresh_files_count)
+        self.files_proxy.modelReset.connect(self._refresh_files_count)
+        return page
+
+    @Slot()
+    def _refresh_files_count(self) -> None:
+        """Update the finished-transfer count from the live proxy."""
+        count = self.files_proxy.rowCount()
+        self.files_count.setText(
+            "No finished transfers yet" if count == 0 else
+            f"{count} finished transfer{'s' if count != 1 else ''} kept locally")
+
     def _build_transfers_page(self) -> QWidget:
         page, layout = self._page(
             "Transfers", "Byte progress and verification are separate phases.")
@@ -709,6 +736,10 @@ class MainWindow(QMainWindow):
         self.transfer_progress.setValue(0)
         self.transfer_progress.setFormat("Select a transfer for phase details")
         layout.addWidget(self.transfer_progress)
+        self.transfer_rate = MonoLabel("Rate not measured")
+        self.transfer_rate.setObjectName("TechnicalDetail")
+        self.transfer_rate.setAccessibleName("Measured transfer rate")
+        layout.addWidget(self.transfer_rate)
         actions = QHBoxLayout()
         self.accept_file = action_button("Accept and choose location", self.accept_offer, True)
         self.decline_file = action_button("Decline offer", self.decline_offer)
@@ -1941,6 +1972,16 @@ class MainWindow(QMainWindow):
             self.transfer_list.addItem(identifier, identifier)
         row = self.transfer_rows[identifier]
         row.update(value)
+        if ("bytes" in value and "total" in value
+                and value.get("state") not in TERMINAL_TRANSFERS):
+            now = time.monotonic()
+            window = [(moment, count) for moment, count
+                      in row.get("_samples", []) if now - moment <= 5.0]
+            window.append((now, float(value["bytes"])))
+            row["_samples"] = window[-6:]
+            rate, eta = transfer_pace(tuple(window), float(value["bytes"]),
+                                      float(value["total"]))
+            row["_rate"], row["_eta"] = rate, eta
         removed = self.transfer_model.upsert(value)
         if removed is not None:
             self.transfer_rows.pop(removed, None)
@@ -1986,6 +2027,12 @@ class MainWindow(QMainWindow):
         else:
             self.transfer_progress.setValue(0)
         self.transfer_progress.setFormat(f"{row.get('state', 'pending')} · %p%")
+        rate = row.get("_rate")
+        if rate is not None:
+            self.transfer_rate.setText(
+                f"{human_bytes(rate)}/s · ETA {format_eta(row.get('_eta'))}")
+        else:
+            self.transfer_rate.setText("Rate not measured")
         pending_offer = row.get("state") == "offer_pending"
         terminal = row.get("state") in TERMINAL_TRANSFERS
         self.accept_file.setEnabled(pending_offer)
