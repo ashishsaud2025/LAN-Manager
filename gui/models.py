@@ -11,7 +11,8 @@ from PySide6.QtCore import (QAbstractListModel, QAbstractTableModel, QModelIndex
                             QObject, QSortFilterProxyModel, Qt)
 from PySide6.QtGui import QFont
 
-from core.peer_repository import PeerRecord
+from core.peer_repository import PeerRecord, TrustState
+from core.services import DirectoryEntry, DirectoryKind, browser_url
 from gui.theme.fonts import mono_family
 
 
@@ -36,6 +37,7 @@ class MessageEntry:
     scope: str
     state: str
     outgoing: bool
+    recorded_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -115,18 +117,20 @@ class PeerListModel(QAbstractListModel):
                                       for item in peer.hello.capabilities) or "Presence only"
             age = max(0.0, time.monotonic() - peer.last_seen)
             state = "Nearby" if peer.nearby else "Offline / stale"
+            trust = peer_trust_label(peer)
             return (f"{peer.hello.name} · {state} · seen {age:.1f}s ago\n"
                     f"{peer.ip}:{peer.hello.tcp_port}  ·  {capabilities}\n"
-                    f"Unverified session {peer.hello.session_id[:8]}…")
+                    f"{trust} · session {peer.hello.session_id[:8]}…")
         if role == self.PeerRole:
             return peer
         if role == Qt.ItemDataRole.ToolTipRole:
             return (f"Peer {peer.hello.peer_id}\nSession {peer.hello.session_id}\n"
-                    "Identity is self-reported and not authenticated.")
+                    f"Trust evidence: {peer_trust_label(peer)}. Discovery itself "
+                    "is not authenticated.")
         if role == Qt.ItemDataRole.AccessibleTextRole:
             return (f"{peer.hello.name}, endpoint {peer.ip}:{peer.hello.tcp_port}, "
                     f"{'nearby' if peer.nearby else 'offline or stale'}, "
-                    "unverified identity")
+                    f"{peer_trust_label(peer)}")
         return None
 
     def set_records(self, records: tuple[PeerRecord, ...]) -> None:
@@ -182,7 +186,7 @@ class PeerTableModel(QAbstractTableModel):
             values = (
                 (f"{peer.hello.name}\n"
                  f"{'Nearby' if peer.nearby else 'Offline / stale'} · "
-                 f"Unverified · {peer.hello.session_id[:8]}…"),
+                 f"{peer_trust_label(peer)} · {peer.hello.session_id[:8]}…"),
                 f"{peer.ip}:{peer.hello.tcp_port}",
                 f"{age:.1f} s ago\n{'Nearby' if peer.nearby else 'Stale'}",
                 "  ·  ".join(capability_label(item)
@@ -192,7 +196,7 @@ class PeerTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.AccessibleTextRole:
             age = max(0.0, time.monotonic() - peer.last_seen)
             values = (
-                f"Session {peer.hello.name}, unverified, identifier "
+                f"Session {peer.hello.name}, {peer_trust_label(peer)}, identifier "
                 f"{peer.hello.session_id}",
                 f"Observed endpoint {peer.ip}:{peer.hello.tcp_port}",
                 f"Last HELLO {age:.1f} seconds ago, "
@@ -237,7 +241,10 @@ class MessageListModel(QAbstractListModel):
         entry = self.entries[index.row()]
         if role == Qt.ItemDataRole.DisplayRole:
             direction = "You" if entry.outgoing else entry.sender
-            return f"{direction} · {entry.scope}\n{entry.text}\n{entry.state}"
+            stamp = (datetime.fromtimestamp(entry.recorded_ms / 1000).strftime("%H:%M:%S")
+                     if entry.recorded_ms > 0 else "time unavailable")
+            return (f"{direction} · {entry.scope} · observed {stamp} local\n"
+                    f"{entry.text}\n{entry.state}")
         if role == Qt.ItemDataRole.AccessibleTextRole:
             return f"{entry.sender}, {entry.text}, state {entry.state}"
         return None
@@ -262,9 +269,55 @@ class MessageListModel(QAbstractListModel):
             return
         entry = self.entries[row]
         self.entries[row] = MessageEntry(entry.identifier, entry.sender, entry.text,
-                                         entry.scope, state, entry.outgoing)
+                                         entry.scope, state, entry.outgoing,
+                                         entry.recorded_ms)
         index = self.index(row, 0)
         self.dataChanged.emit(index, index)
+
+    def set_entries(self, entries: list[MessageEntry]) -> None:
+        """Replace history from one bounded canonical journal snapshot."""
+        self.beginResetModel()
+        self.entries = entries[-self.limit:]
+        self.endResetModel()
+
+
+class DirectoryListModel(QAbstractListModel):
+    """Present local publications without inferring reachability or health."""
+
+    EntryRole = Qt.ItemDataRole.UserRole + 1
+
+    def __init__(self, kind: DirectoryKind) -> None:
+        super().__init__()
+        self.kind = kind
+        self.entries: tuple[DirectoryEntry, ...] = ()
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.entries)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if not index.isValid() or not 0 <= index.row() < len(self.entries):
+            return None
+        entry = self.entries[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            description = entry.description or "No description"
+            return (f"{entry.name}\n{browser_url(entry)}\n{description}\n"
+                    "Published locally · Reachability not checked · Health not defined")
+        if role == self.EntryRole:
+            return entry
+        if role == Qt.ItemDataRole.AccessibleTextRole:
+            return (f"{entry.kind.value} {entry.name}, published locally at "
+                    f"{browser_url(entry)}, reachability not checked, health not defined")
+        return None
+
+    def set_entries(self, entries: tuple[DirectoryEntry, ...]) -> None:
+        """Replace one complete filtered directory snapshot."""
+        self.beginResetModel()
+        self.entries = tuple(entry for entry in entries if entry.kind is self.kind)
+        self.endResetModel()
+
+    def entry_at(self, row: int) -> DirectoryEntry | None:
+        """Return one publication by visible row."""
+        return self.entries[row] if 0 <= row < len(self.entries) else None
 
 
 class TransferListModel(QAbstractListModel):
@@ -385,6 +438,7 @@ class PostListModel(QAbstractListModel):
         self.posts: list[dict[str, Any]] = []
         self.local_peer_id = ""
         self.author_names: dict[str, str] = {}
+        self.security_labels: dict[str, str] = {}
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.posts)
@@ -396,26 +450,30 @@ class PostListModel(QAbstractListModel):
         if role == Qt.ItemDataRole.DisplayRole:
             author_id = post["author_id"]
             author = self.author_names.get(author_id, f"Peer {author_id[:8]}…")
-            provenance = "Stored copy"
+            provenance = ("Published locally" if author_id == self.local_peer_id
+                          else "Cached copy")
             try:
                 stamp = datetime.fromtimestamp(
                     post["created_ms"] / 1000).strftime("%Y-%m-%d %H:%M")
             except (OSError, OverflowError, ValueError):
                 stamp = "time unavailable"
             refs = f"\n{len(post['refs'])} attachment reference(s)" if post["refs"] else ""
+            security = self.security_labels.get(post["post_id"], "Unsigned")
             return (f"{author} · {provenance}\n{post['text']}\n"
-                    f"Reported {stamp}; peer clocks may differ{refs}")
+                    f"Reported {stamp}; peer clocks may differ · {security}{refs}")
         if role == Qt.ItemDataRole.AccessibleTextRole:
             return f"Post by {post['author_id']}, {post['text']}"
         return None
 
     def set_posts(self, posts: list[dict[str, Any]], local_peer_id: str,
-                  author_names: dict[str, str]) -> None:
+                  author_names: dict[str, str],
+                  security_labels: dict[str, str] | None = None) -> None:
         """Replace the visible bounded page and its current author labels."""
         self.beginResetModel()
         self.posts = posts
         self.local_peer_id = local_peer_id
         self.author_names = dict(author_names)
+        self.security_labels = dict(security_labels or {})
         self.endResetModel()
 
     def set_author_names(self, author_names: dict[str, str]) -> None:
@@ -463,4 +521,14 @@ class ActivityListModel(QAbstractListModel):
 def capability_label(value: str) -> str:
     """Translate known wire capability names without hiding unknown values."""
     return {"chat_v1": "Chat", "file_v1": "Files", "posts_v1": "Posts",
-            "echo_v1": "Echo"}.get(value, value)
+            "echo_v1": "Echo", "secure_transport_v1": "Secure TLS"}.get(
+                value, value)
+
+
+def peer_trust_label(peer: PeerRecord) -> str:
+    """Describe stored key evidence without claiming current authentication."""
+    return {
+        TrustState.UNVERIFIED: "Unverified",
+        TrustState.PAIRED: "Paired key",
+        TrustState.KEY_CHANGED: "Key changed",
+    }[peer.trust_state]

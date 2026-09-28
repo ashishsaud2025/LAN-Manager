@@ -7,7 +7,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QVBoxLayout,
                                  QWidget)
 
-from core.peer_repository import OverviewSummary, PeerRecord
+from core.peer_repository import OverviewSummary, PeerRecord, TrustState
 from core.discovery import Hello
 from gui.models import ActivityListModel
 from gui.theme.tokens import SPACE
@@ -71,9 +71,13 @@ def state_pill_for(record: PeerRecord | None) -> StatusPill:
     return StatusPill(text, key)
 
 
-def trust_pill() -> StatusPill:
-    """Return the static unverified identity pill until pairing exists."""
-    return StatusPill("Unverified", "unverified")
+def trust_pill(record: PeerRecord | None = None) -> StatusPill:
+    """Build a per-peer stored-key pill without claiming active authentication."""
+    if record is None or record.trust_state is TrustState.UNVERIFIED:
+        return StatusPill("Unverified", "unverified")
+    if record.trust_state is TrustState.KEY_CHANGED:
+        return StatusPill("Key changed", "key_changed")
+    return StatusPill("Paired key", "paired")
 
 
 def breakdown_segments(summary: OverviewSummary) -> list[tuple[float, str]]:

@@ -13,7 +13,10 @@ from PySide6.QtWidgets import QApplication
 
 from core.chat import ChatService
 from core.discovery import Hello
+from core.identity import DeviceIdentity
+from core.secure_transport import SECURE_PORT, SecureTransport
 from core.storage import JsonLinesPostStore
+from core.trust import TrustStore
 from gui.main_window import MainWindow
 from m1_discovery import load_identity, port_number
 
@@ -26,17 +29,30 @@ def main() -> int:
     parser.add_argument("--name", required=True)
     parser.add_argument("--port", type=port_number, default=50000)
     parser.add_argument("--tcp-port", type=port_number, default=50001)
+    parser.add_argument("--secure-port", type=port_number, default=SECURE_PORT)
     parser.add_argument("--broadcast", default="255.255.255.255")
     parser.add_argument("--reuse-address", action="store_true")
     parser.add_argument("--identity-file", type=Path, default=root / "lan-manager/peer-id")
+    parser.add_argument("--security-identity-file", type=Path,
+                        default=root / "lan-manager/identity.pem")
+    parser.add_argument("--trust-file", type=Path,
+                        default=root / "lan-manager/trust.json")
     parser.add_argument("--post-file", type=Path, default=root / "lan-manager/posts.jsonl")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     try:
-        hello = Hello(load_identity(args.identity_file), str(uuid4()), args.name,
-                      args.tcp_port, ("chat_v1", "file_v1", "posts_v1"))
+        peer_id = load_identity(args.identity_file)
+        identity = DeviceIdentity.load_or_create(
+            args.security_identity_file, peer_id)
+        hello = Hello(
+            peer_id, str(uuid4()), args.name, args.tcp_port,
+            ("chat_v1", "file_v1", "posts_v1", "secure_transport_v1"),
+            args.secure_port, identity.fingerprint)
+        secure_transport = SecureTransport(
+            identity, TrustStore(args.trust_file), hello)
         service = ChatService(hello, args.port, args.broadcast, args.reuse_address,
-                              JsonLinesPostStore(args.post_file))
+                              JsonLinesPostStore(args.post_file),
+                              secure_transport=secure_transport)
     except (ValueError, OSError) as error:
         logging.error("Startup failed: %s", error)
         return 1
@@ -47,6 +63,9 @@ def main() -> int:
     try:
         return app.exec()
     finally:
+        window.portal.stop()
+        if not window.portal.join():
+            logging.error("Portal worker did not finish within shutdown deadline")
         service.stop()
         if not service.join():
             logging.error("Network workers did not finish within shutdown deadline")

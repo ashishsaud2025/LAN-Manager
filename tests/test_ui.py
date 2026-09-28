@@ -541,7 +541,8 @@ def test_human_messages_do_not_enter_activity_transcript(window: object) -> None
     before = window.activity_model.rowCount()
     message = envelope("CHAT", peer.hello.peer_id, peer.hello.session_id,
                        {"scope": "room", "text": "human-only text"})
-    window.service.events.put(("message", message))
+    window.service.message_journal.record_incoming(
+        message, peer.hello.name, window.service.hello)
     window.drain()
     assert window.message_model.rowCount() == 1
     assert window.activity_model.rowCount() == before
@@ -563,12 +564,11 @@ def test_message_outcome_updates_message_row(window: object) -> None:
     window.input.setText("hello")
     window.send()
     identifier = window.message_model.entries[0].identifier
-    window.service.events.put(("message_outcome", {
-        "message_id": identifier, "session_id": peer.hello.session_id,
-        "peer_name": peer.hello.name, "state": "accepted",
-        "detail": "accepted by receiving application"}))
+    window.service.message_journal.update_delivery(
+        identifier, peer.hello.session_id, "accepted",
+        "accepted by receiving application")
     window.drain()
-    assert "Accepted by 1" in window.message_model.data(
+    assert "1 accepted by receiving application" in window.message_model.data(
         window.message_model.index(0, 0))
 
 

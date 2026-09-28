@@ -8,23 +8,31 @@ from queue import Empty
 import time
 from typing import Any
 
-from PySide6.QtCore import QModelIndex, QSettings, Qt, QTimer, Slot
-from PySide6.QtGui import QCloseEvent, QKeySequence, QResizeEvent, QShortcut, QTextCursor
+from PySide6.QtCore import QModelIndex, QSettings, Qt, QTimer, QUrl, Slot
+from PySide6.QtGui import (QCloseEvent, QDesktopServices, QKeySequence,
+                           QResizeEvent, QShortcut, QTextCursor)
 from PySide6.QtWidgets import (
     QAbstractButton, QApplication, QComboBox, QDoubleSpinBox, QFileDialog,
     QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QListView, QMainWindow, QProgressBar, QPushButton, QScrollArea, QSpinBox,
-    QSplitter, QStackedWidget, QTableView, QTabWidget, QTextEdit, QVBoxLayout,
-    QWidget,
+    QListView, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+    QSpinBox, QSplitter, QStackedWidget, QTableView, QTabWidget, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
 from core.chat import ChatService
 from core.diagnostics import Neighbor, NeighborSnapshot, ProbeResult
+from core.discovery import local_ipv4_addresses
+from core.message_journal import MessageRecord
 from core.peer_repository import (
     CompatibilityState, DiscoveryState, PeerRecord, PeerRepositoryEvent,
-    ReachabilityState,
+    ReachabilityState, TrustState,
 )
+from core.post_signatures import verify_post
+from core.portal import PORTAL_PORT, PortalServer
 from core.roster import Peer
+from core.secure_transport import PairingCandidate, SecureTransportError
+from core.services import (DirectoryEntry, DirectoryKind, LocalServiceDirectory,
+                           browser_url)
 from gui.components import NavigationRail, action_button, page_header
 from gui.pages.devices import FILTER_TABS, filter_tabs, identity_block, tab_counts
 from gui.pages.network import hud_selected_block, metric_value, toolbar_title
@@ -41,9 +49,9 @@ from gui.widgets.status_pill import StatusPill
 from gui.widgets.top_bar import TopBar
 from gui.models import (
     ActivityEntry, ActivityListModel, AdminDevice, AdminDeviceListModel,
-    MessageEntry, MessageListModel, PeerListModel, PeerTableModel, PostListModel,
-    TerminalTransferProxy, TransferListModel, capability_label, format_eta,
-    human_bytes, transfer_pace,
+    DirectoryListModel, MessageEntry, MessageListModel, PeerListModel,
+    PeerTableModel, PostListModel, TerminalTransferProxy, TransferListModel,
+    capability_label, format_eta, human_bytes, peer_trust_label, transfer_pace,
 )
 from gui.peer_selection import PeerSelection
 from gui.theme import GEOMETRY, SPACING, apply_theme
@@ -65,7 +73,9 @@ TERMINAL_TRANSFERS = {"failed", "cancelled", "declined", "saved", "verified"}
 class MainWindow(QMainWindow):
     """Present peer-to-peer state without implying central trust or connectivity."""
 
-    def __init__(self, service: ChatService) -> None:
+    def __init__(self, service: ChatService,
+                 portal: PortalServer | None = None,
+                 directory: LocalServiceDirectory | None = None) -> None:
         super().__init__()
         self.settings = QSettings("LAN Manager", "LAN Atlas")
         self.theme_mode = str(self.settings.value("appearance/theme", "observatory"))
@@ -73,19 +83,36 @@ class MainWindow(QMainWindow):
         if app is not None:
             self.theme_mode = apply_theme(app, self.theme_mode)
         self.service = service
+        if portal is not None:
+            content = portal.content
+            if (content.hello != service.hello
+                    or content.peers is not service.peer_repository
+                    or content.posts is not service.post_store
+                    or content.messages_store is not service.message_journal):
+                raise ValueError("portal must share the desktop core repositories")
+            if directory is None:
+                directory = content.directory_store
+            elif content.directory_store is not directory:
+                raise ValueError("portal must share the desktop service directory")
+        self.directory = directory or LocalServiceDirectory(service.hello)
+        self.portal = portal or PortalServer(
+            service.hello, service.peer_repository, service.post_store,
+            service.message_journal, self.directory)
         self.peer_records: tuple[PeerRecord, ...] = service.peer_repository.snapshot()
         self._peer_revision = 0
         self.peer_selection = PeerSelection()
         self.neighbors: tuple[Neighbor, ...] = ()
         self.transfer_rows: dict[str, dict[str, Any]] = {}
         self.selected_transfer_id: str | None = None
-        self.message_outcomes: dict[str, dict[str, str]] = {}
+        self._message_revision = -1
         self.active_probe_id: str | None = None
         self.inventory_request_id: str | None = None
         self._next_presence_refresh = 0.0
         self.peer_model = PeerListModel()
         self.peer_table_model = PeerTableModel()
         self.message_model = MessageListModel()
+        self.game_model = DirectoryListModel(DirectoryKind.GAME)
+        self.service_model = DirectoryListModel(DirectoryKind.SERVICE)
         self.transfer_model = TransferListModel()
         self.post_model = PostListModel()
         self.activity_model = ActivityListModel()
@@ -112,6 +139,8 @@ class MainWindow(QMainWindow):
         self.peer_selection.changed.connect(self._sync_peer_selection)
         self._apply_responsive_layout(self.width())
         self._install_shortcuts()
+        self._refresh_messages()
+        self._refresh_directory()
         self.refresh_feed()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.drain)
@@ -151,10 +180,7 @@ class MainWindow(QMainWindow):
         self._add_page(self._build_transfers_page(), 560)
         self._add_page(self._build_messages_page(), 560)
         self._add_page(self._build_feed_page(), 560)
-        self._add_page(self._build_placeholder_page(
-            "Games", "LAN game and session discovery is planned for a later phase.",
-            "LAN Atlas will show only explicitly advertised game sessions and known "
-            "reachability evidence. It will not add multiplayer to unsupported games."), 420)
+        self._add_page(self._build_directory_page(), 520)
         self._add_page(self._build_activity_page(), 560)
         self._add_page(self._build_settings_page(), 640)
         workspace_layout.addWidget(self.stack, 1)
@@ -398,7 +424,8 @@ class MainWindow(QMainWindow):
         self.status_help = QLabel(
             "Nearby means a UDP HELLO was observed recently. Reachable will mean a TCP "
             "probe succeeded. Compatible will mean a versioned protocol exchange worked. "
-            "Authenticated is reserved for future cryptographic pairing.")
+            "Paired key means a certificate was explicitly pinned; authenticated applies "
+            "only to an individual connection that proves that key over TLS.")
         self.status_help.setObjectName("PageSubtitle")
         self.status_help.setWordWrap(True)
         self.status_help.setVisible(False)
@@ -474,7 +501,7 @@ class MainWindow(QMainWindow):
         legend = QLabel(
             "● Nearby\n  Recent UDP HELLO observed\n\n"
             "○ Reachable\n  Requires an explicit successful check\n\n"
-            "◇ Trust\n  No authenticated identity established")
+            "◇ Trust\n  Per-device certificate pairing; discovery stays self-reported")
         legend.setObjectName("TechnicalDetail")
         legend.setWordWrap(True)
         hud_layout.addWidget(legend_title)
@@ -583,6 +610,10 @@ class MainWindow(QMainWindow):
         self.peer_tcp_button = action_button(
             "TCP test", lambda: self._probe_selected_peer("tcp"))
         self.peer_copy_button = action_button("Copy address", self._copy_peer_address)
+        self.peer_pair_button = action_button(
+            "Pair device", self._pair_selected_peer, True)
+        self.peer_forget_button = action_button(
+            "Forget pairing", self._forget_selected_peer)
         self.peer_probe_button = QPushButton("Open in Workbench")
         self.peer_probe_button.setToolTip(
             "Use this observed endpoint for an explicit ping or TCP check.")
@@ -590,7 +621,8 @@ class MainWindow(QMainWindow):
         for button in (self.peer_message_button, self.peer_file_button,
                        self.peer_sync_button, self.peer_ping_button,
                        self.peer_tcp_button, self.peer_copy_button,
-                       self.peer_probe_button):
+                       self.peer_probe_button, self.peer_pair_button,
+                       self.peer_forget_button):
             button.setEnabled(False)
         details.addWidget(self.peer_name)
         details.addWidget(self.peer_presence)
@@ -625,8 +657,9 @@ class MainWindow(QMainWindow):
         self.peer_nearby_evidence = QLabel("● Nearby        Recent HELLO observed")
         self.peer_reachable_evidence = QLabel("○ Reachable     Not tested")
         self.peer_compatible_evidence = QLabel("○ Compatible    Not tested")
+        self.peer_trust_evidence = QLabel("◇ Paired key    Not established")
         for item in (self.peer_nearby_evidence, self.peer_reachable_evidence,
-                     self.peer_compatible_evidence):
+                     self.peer_compatible_evidence, self.peer_trust_evidence):
             item.setObjectName("TechnicalDetail")
             evidence_layout.addWidget(item)
         details.addWidget(evidence_panel)
@@ -640,6 +673,8 @@ class MainWindow(QMainWindow):
         detail_actions.addWidget(self.peer_ping_button, 2, 0)
         detail_actions.addWidget(self.peer_tcp_button, 2, 1)
         detail_actions.addWidget(self.peer_copy_button, 3, 0, 1, 2)
+        detail_actions.addWidget(self.peer_pair_button, 4, 0)
+        detail_actions.addWidget(self.peer_forget_button, 4, 1)
         details.addLayout(detail_actions)
         self.peer_splitter.addWidget(inspector)
         self.peer_splitter.setSizes([720, 500])
@@ -795,6 +830,47 @@ class MainWindow(QMainWindow):
         self.feed_log.setReadOnly(True)
         self.feed_log.setVisible(False)
         layout.addWidget(self.feed_log)
+        return page
+
+    def _build_directory_page(self) -> QWidget:
+        page, layout = self._page(
+            "Games and services",
+            "Explicit local publications only; reachability and health are not inferred.")
+        self.directory_tabs = QTabWidget()
+        self.game_view = QListView()
+        self.game_view.setModel(self.game_model)
+        self.game_view.setAccessibleName("Published game sessions")
+        self.game_view.setWordWrap(True)
+        self.game_view.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.service_view = QListView()
+        self.service_view.setModel(self.service_model)
+        self.service_view.setAccessibleName("Published LAN services")
+        self.service_view.setWordWrap(True)
+        self.service_view.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.directory_tabs.addTab(self.game_view, "Games")
+        self.directory_tabs.addTab(self.service_view, "Services")
+        self.directory_tabs.currentChanged.connect(
+            lambda _index: self._update_directory_open())
+        self.game_view.selectionModel().currentChanged.connect(
+            lambda _current, _previous: self._update_directory_open())
+        self.service_view.selectionModel().currentChanged.connect(
+            lambda _current, _previous: self._update_directory_open())
+        layout.addWidget(self.directory_tabs, 1)
+        actions = QHBoxLayout()
+        self.directory_open = action_button(
+            "Open selected HTTP service", self._open_directory_entry, True)
+        self.directory_open.setEnabled(False)
+        actions.addWidget(self.directory_open)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        note = QLabel(
+            "Open hands a validated HTTP or HTTPS URL to the platform browser. It does "
+            "not prove the endpoint is reachable, healthy, trusted, or multiplayer-capable.")
+        note.setObjectName("PageSubtitle")
+        note.setWordWrap(True)
+        layout.addWidget(note)
         return page
 
     def _build_placeholder_page(self, title: str, subtitle: str, body: str) -> QWidget:
@@ -1075,28 +1151,39 @@ class MainWindow(QMainWindow):
 
     def _build_settings_page(self) -> QWidget:
         page, layout = self._page(
-            "Settings", "Phase 1 exposes local identity; network settings remain CLI-configured.")
+            "Settings", "Local identity, appearance, and explicitly bound portal access.")
         identity = QFrame()
         identity.setProperty("card", True)
         form = QGridLayout(identity)
+        transport = self.service.secure_transport
+        fingerprint = (transport.identity.fingerprint if transport is not None
+                       else "Not configured")
+        paired_count = (len(transport.trust_store.snapshot().records)
+                        if transport is not None else 0)
         values = (
             ("Display name", self.service.hello.name),
             ("Installation ID", self.service.hello.peer_id),
             ("Session ID", self.service.hello.session_id),
             ("Application port", str(self.service.hello.tcp_port)),
+            ("Secure application port",
+             str(self.service.hello.secure_port or "Not configured")),
             ("Capabilities", ", ".join(self.service.hello.capabilities) or "presence only"),
-            ("Trust", "Unverified; no cryptographic pairing configured"),
+            ("Identity certificate SHA-256", fingerprint),
+            ("Paired devices", f"{paired_count} pinned certificate(s)"),
         )
         for row, (name, value) in enumerate(values):
             label = QLabel(name)
             label.setObjectName("MetricLabel")
             content = QLabel(value)
-            if name in {"Installation ID", "Session ID", "Application port"}:
+            if name in {"Installation ID", "Session ID", "Application port",
+                        "Secure application port", "Identity certificate SHA-256"}:
                 content.setProperty("technical", True)
             content.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             content.setWordWrap(True)
             form.addWidget(label, row, 0)
             form.addWidget(content, row, 1)
+            if name == "Paired devices":
+                self.settings_trust = content
         appearance_row = len(values)
         appearance_label = QLabel("Appearance")
         appearance_label.setObjectName("MetricLabel")
@@ -1109,18 +1196,149 @@ class MainWindow(QMainWindow):
         form.addWidget(appearance_label, appearance_row, 0)
         form.addWidget(self.theme_selector, appearance_row, 1)
         layout.addWidget(identity)
+        portal = QFrame()
+        portal.setProperty("card", True)
+        portal_layout = QVBoxLayout(portal)
+        portal_header = QHBoxLayout()
+        portal_heading = QLabel("LAN Atlas Portal")
+        portal_heading.setObjectName("PanelTitle")
+        self.portal_status = StatusPill("Stopped", "offline")
+        portal_header.addWidget(portal_heading)
+        portal_header.addStretch(1)
+        portal_header.addWidget(self.portal_status)
+        portal_layout.addLayout(portal_header)
+        portal_detail = QLabel(
+            "Serve selected read-only LAN Atlas pages to a normal browser. Choose one "
+            "concrete LAN address; the portal never binds every interface implicitly.")
+        portal_detail.setObjectName("PageSubtitle")
+        portal_detail.setWordWrap(True)
+        portal_layout.addWidget(portal_detail)
+        portal_form = QGridLayout()
+        portal_form.addWidget(QLabel("Interface address"), 0, 0)
+        self.portal_address = QComboBox()
+        self.portal_address.setEditable(True)
+        self.portal_address.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.portal_address.setPlaceholderText("Enter a concrete IPv4 address")
+        addresses = local_ipv4_addresses()
+        for address in addresses:
+            self.portal_address.addItem(address, address)
+        if addresses:
+            self.portal_address.setCurrentIndex(0)
+        self.portal_address.setAccessibleName("Portal interface address")
+        portal_form.addWidget(self.portal_address, 0, 1)
+        portal_form.addWidget(QLabel("Port"), 1, 0)
+        self.portal_port = QSpinBox()
+        self.portal_port.setRange(1, 65535)
+        self.portal_port.setValue(PORTAL_PORT)
+        self.portal_port.setAccessibleName("Portal TCP port")
+        portal_form.addWidget(self.portal_port, 1, 1)
+        portal_layout.addLayout(portal_form)
+        self.portal_url = MonoLabel("Portal stopped")
+        self.portal_url.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        portal_layout.addWidget(self.portal_url)
+        portal_actions = QHBoxLayout()
+        self.portal_start = action_button(
+            "Start portal", self._start_portal, True)
+        self.portal_stop = action_button("Stop", self._stop_portal)
+        self.portal_open = action_button("Open", self._open_portal)
+        self.portal_copy = action_button("Copy address", self._copy_portal_address)
+        for button in (self.portal_start, self.portal_stop,
+                       self.portal_open, self.portal_copy):
+            portal_actions.addWidget(button)
+        self.portal_address.currentTextChanged.connect(
+            lambda _text: self._refresh_portal_state())
+        portal_actions.addStretch(1)
+        portal_layout.addLayout(portal_actions)
+        portal_warning = QLabel(
+            "Portal traffic is plaintext and unauthenticated. Browser writes, diagnostics, "
+            "settings, uploads, and shell access are not exposed.")
+        portal_warning.setObjectName("PageSubtitle")
+        portal_warning.setWordWrap(True)
+        portal_layout.addWidget(portal_warning)
+        layout.addWidget(portal)
+        self._refresh_portal_state()
+        publications = QFrame()
+        publications.setProperty("card", True)
+        publication_layout = QVBoxLayout(publications)
+        publication_heading = QLabel("Published services and games")
+        publication_heading.setObjectName("PanelTitle")
+        publication_layout.addWidget(publication_heading)
+        publication_detail = QLabel(
+            "Session-local entries appear on this desktop and its portal. They are not "
+            "advertised through discovery and are not checked for reachability or health.")
+        publication_detail.setObjectName("PageSubtitle")
+        publication_detail.setWordWrap(True)
+        publication_layout.addWidget(publication_detail)
+        publication_form = QGridLayout()
+        self.directory_selector = QComboBox()
+        self.directory_selector.addItem("New publication", None)
+        publication_form.addWidget(QLabel("Entry"), 0, 0)
+        publication_form.addWidget(self.directory_selector, 0, 1)
+        self.directory_kind = QComboBox()
+        self.directory_kind.addItem("Service", DirectoryKind.SERVICE.value)
+        self.directory_kind.addItem("Game", DirectoryKind.GAME.value)
+        publication_form.addWidget(QLabel("Kind"), 1, 0)
+        publication_form.addWidget(self.directory_kind, 1, 1)
+        self.directory_name = QLineEdit()
+        self.directory_name.setMaxLength(80)
+        publication_form.addWidget(QLabel("Name"), 2, 0)
+        publication_form.addWidget(self.directory_name, 2, 1)
+        self.directory_description = QLineEdit()
+        self.directory_description.setMaxLength(500)
+        publication_form.addWidget(QLabel("Description"), 3, 0)
+        publication_form.addWidget(self.directory_description, 3, 1)
+        self.directory_scheme = QComboBox()
+        self.directory_scheme.addItem("HTTP", "http")
+        self.directory_scheme.addItem("HTTPS", "https")
+        publication_form.addWidget(QLabel("Scheme"), 4, 0)
+        publication_form.addWidget(self.directory_scheme, 4, 1)
+        self.directory_host = QComboBox()
+        self.directory_host.setEditable(True)
+        self.directory_host.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.directory_host.setPlaceholderText("Concrete LAN IPv4 address")
+        directory_addresses = local_ipv4_addresses()
+        for address in directory_addresses:
+            self.directory_host.addItem(address, address)
+        if directory_addresses:
+            self.directory_host.setCurrentIndex(0)
+        publication_form.addWidget(QLabel("Host"), 5, 0)
+        publication_form.addWidget(self.directory_host, 5, 1)
+        self.directory_port = QSpinBox()
+        self.directory_port.setRange(1, 65535)
+        self.directory_port.setValue(8000)
+        publication_form.addWidget(QLabel("Port"), 6, 0)
+        publication_form.addWidget(self.directory_port, 6, 1)
+        self.directory_path = QLineEdit("/")
+        self.directory_path.setMaxLength(255)
+        publication_form.addWidget(QLabel("Path"), 7, 0)
+        publication_form.addWidget(self.directory_path, 7, 1)
+        publication_layout.addLayout(publication_form)
+        publication_actions = QHBoxLayout()
+        self.directory_publish = action_button(
+            "Publish locally", self._publish_directory_entry, True)
+        self.directory_withdraw = action_button(
+            "Withdraw", self._withdraw_directory_entry)
+        self.directory_withdraw.setEnabled(False)
+        publication_actions.addWidget(self.directory_publish)
+        publication_actions.addWidget(self.directory_withdraw)
+        publication_actions.addStretch(1)
+        publication_layout.addLayout(publication_actions)
+        self.directory_selector.currentIndexChanged.connect(
+            self._load_directory_entry)
+        layout.addWidget(publications)
         security = QFrame()
         security.setProperty("card", True)
         security_layout = QVBoxLayout(security)
-        security_heading = QLabel("Unverified LAN")
-        security_heading.setObjectName("SecurityHeading")
-        security_detail = QLabel(
-            "Peer names, installation IDs, session IDs, posts, and advertised features are "
-            "self-reported. Current application traffic is not authenticated or encrypted. "
-            "Nearby means only that this instance recently received a discovery announcement.")
-        security_detail.setWordWrap(True)
-        security_layout.addWidget(security_heading)
-        security_layout.addWidget(security_detail)
+        self.settings_security_heading = QLabel("Per-device trust")
+        self.settings_security_heading.setObjectName("SecurityHeading")
+        self.settings_security_detail = QLabel(
+            "Discovery remains self-reported. Unpaired peers use visibly labeled legacy "
+            "plaintext. Paired chat, feed, and file connections require the pinned device "
+            "certificate over TLS; the browser portal remains plaintext and unauthenticated.")
+        self.settings_security_detail.setWordWrap(True)
+        security_layout.addWidget(self.settings_security_heading)
+        security_layout.addWidget(self.settings_security_detail)
         layout.addWidget(security)
         layout.addStretch(1)
         return page
@@ -1190,6 +1408,252 @@ class MainWindow(QMainWindow):
         self.overview_topology.set_theme(self.theme_mode)
         self.topology.select_session(self.peer_selection.session_id)
         self.overview_topology.select_session(self.peer_selection.session_id)
+
+    @Slot()
+    def _start_portal(self) -> None:
+        """Start the browser portal on the explicitly selected address."""
+        address = self.portal_address.currentText().strip()
+        if not address:
+            self.append("Select a concrete LAN interface before starting the portal.",
+                        "Portal", "warning")
+            return
+        try:
+            state = self.portal.start(address, self.portal_port.value())
+        except (OSError, RuntimeError, ValueError) as error:
+            self.append(f"Portal start failed: {error}", "Portal", "warning")
+            self._refresh_portal_state()
+            return
+        self.append(f"Portal listening at {state.url}", "Portal")
+        self._refresh_portal_state()
+
+    @Slot()
+    def _stop_portal(self) -> None:
+        """Request portal shutdown without waiting in the Qt event loop."""
+        self.portal.stop()
+        self.append("Portal stop requested.", "Portal")
+        self._refresh_portal_state()
+
+    @Slot()
+    def _open_portal(self) -> None:
+        """Open the current concrete portal URL in the platform browser."""
+        url = self.portal.state().url
+        if url is None:
+            return
+        if not QDesktopServices.openUrl(QUrl(url)):
+            self.append("The platform browser did not accept the portal URL.",
+                        "Portal", "warning")
+
+    @Slot()
+    def _copy_portal_address(self) -> None:
+        """Copy the current concrete portal URL to the system clipboard."""
+        url = self.portal.state().url
+        if url is not None:
+            QApplication.clipboard().setText(url)
+
+    def _refresh_portal_state(self) -> None:
+        """Render one thread-safe portal lifecycle snapshot."""
+        state = self.portal.state()
+        running = state.phase == "running"
+        stopping = state.phase == "stopping"
+        if running:
+            self.portal_status.setText("Running")
+            self.portal_status.set_state("reachable")
+            self.portal_url.setText(state.url or "Portal running")
+        elif stopping:
+            self.portal_status.setText("Stopping")
+            self.portal_status.set_state("unverified")
+            self.portal_url.setText(state.url or "Portal stopping")
+        elif state.phase == "failed":
+            self.portal_status.setText("Failed")
+            self.portal_status.set_state("unverified")
+            self.portal_url.setText(f"Portal failed: {state.error}")
+        else:
+            self.portal_status.setText("Stopped")
+            self.portal_status.set_state("offline")
+            self.portal_url.setText("Portal stopped")
+        selectable = bool(self.portal_address.currentText().strip())
+        self.portal_start.setEnabled(not running and not stopping and selectable)
+        self.portal_stop.setEnabled(running)
+        self.portal_open.setEnabled(running and state.url is not None)
+        self.portal_copy.setEnabled(running and state.url is not None)
+        self.portal_address.setEnabled(not running and not stopping)
+        self.portal_port.setEnabled(not running and not stopping)
+
+    @Slot(int)
+    def _load_directory_entry(self, index: int) -> None:
+        """Load one local publication into desktop-only editing controls."""
+        identifier = self.directory_selector.itemData(index)
+        entry = self.directory.get(identifier if isinstance(identifier, str) else None)
+        if entry is None:
+            self.directory_publish.setText("Publish locally")
+            self.directory_withdraw.setEnabled(False)
+            self.directory_name.clear()
+            self.directory_description.clear()
+            self.directory_path.setText("/")
+            return
+        self.directory_kind.setCurrentIndex(
+            self.directory_kind.findData(entry.kind.value))
+        self.directory_name.setText(entry.name)
+        self.directory_description.setText(entry.description)
+        self.directory_scheme.setCurrentIndex(
+            self.directory_scheme.findData(entry.scheme))
+        self.directory_host.setCurrentText(entry.host)
+        self.directory_port.setValue(entry.port)
+        self.directory_path.setText(entry.path)
+        self.directory_publish.setText("Update publication")
+        self.directory_withdraw.setEnabled(True)
+
+    @Slot()
+    def _publish_directory_entry(self) -> None:
+        """Register or update one validated session-local publication."""
+        identifier = self.directory_selector.currentData()
+        values = (
+            str(self.directory_kind.currentData()),
+            self.directory_name.text(),
+            self.directory_description.text(),
+            str(self.directory_scheme.currentData()),
+            self.directory_host.currentText(),
+            self.directory_port.value(),
+            self.directory_path.text(),
+        )
+        try:
+            if isinstance(identifier, str):
+                entry = self.directory.update(identifier, *values)
+                action = "Updated"
+            else:
+                entry = self.directory.register(*values)
+                action = "Published"
+        except (KeyError, RuntimeError, ValueError) as error:
+            self.append(f"Directory publication failed: {error}",
+                        "Services", "warning")
+            return
+        self._refresh_directory(entry.service_id)
+        self.append(f"{action} {entry.kind.value} {entry.name!r} locally; "
+                    "reachability was not checked.", "Services")
+
+    @Slot()
+    def _withdraw_directory_entry(self) -> None:
+        """Withdraw one selected session-local publication."""
+        identifier = self.directory_selector.currentData()
+        if not isinstance(identifier, str):
+            return
+        try:
+            entry = self.directory.withdraw(identifier)
+        except KeyError as error:
+            self.append(str(error), "Services", "warning")
+            self._refresh_directory()
+            return
+        self._refresh_directory()
+        self.append(f"Withdrew {entry.kind.value} {entry.name!r}.", "Services")
+
+    def _refresh_directory(self, selected_id: str | None = None) -> None:
+        """Project one shared directory snapshot into desktop models and controls."""
+        snapshot = self.directory.snapshot()
+        self.game_model.set_entries(snapshot.entries)
+        self.service_model.set_entries(snapshot.entries)
+        if selected_id is None:
+            current = self.directory_selector.currentData()
+            selected_id = current if isinstance(current, str) else None
+        self.directory_selector.blockSignals(True)
+        self.directory_selector.clear()
+        self.directory_selector.addItem("New publication", None)
+        for entry in snapshot.entries:
+            self.directory_selector.addItem(
+                f"{entry.kind.value.title()} · {entry.name}", entry.service_id)
+        index = self.directory_selector.findData(selected_id)
+        self.directory_selector.setCurrentIndex(max(0, index))
+        self.directory_selector.blockSignals(False)
+        self._load_directory_entry(self.directory_selector.currentIndex())
+        self._update_directory_open()
+
+    def _selected_directory_entry(self) -> DirectoryEntry | None:
+        view = self.game_view if self.directory_tabs.currentIndex() == 0 else self.service_view
+        model = self.game_model if view is self.game_view else self.service_model
+        return model.entry_at(view.currentIndex().row())
+
+    @Slot()
+    def _update_directory_open(self) -> None:
+        """Enable browser handoff only for a currently selected publication."""
+        self.directory_open.setEnabled(self._selected_directory_entry() is not None)
+
+    @Slot()
+    def _open_directory_entry(self) -> None:
+        """Open one validated URL without claiming endpoint availability."""
+        entry = self._selected_directory_entry()
+        if entry is None:
+            return
+        try:
+            url = browser_url(entry)
+        except ValueError as error:
+            self.append(f"Service URL rejected: {error}", "Services", "warning")
+            return
+        if not QDesktopServices.openUrl(QUrl(url)):
+            self.append("The platform browser did not accept the service URL.",
+                        "Services", "warning")
+
+    def _refresh_messages(self) -> None:
+        """Project one canonical journal revision into the Qt message model."""
+        snapshot = self.service.message_journal.snapshot()
+        if snapshot.revision == self._message_revision:
+            return
+        current_row = self.message_view.currentIndex().row()
+        selected_id = (self.message_model.entries[current_row].identifier
+                       if 0 <= current_row < len(self.message_model.entries) else None)
+        scroll = self.message_view.verticalScrollBar()
+        old_scroll = scroll.value()
+        follow_latest = old_scroll >= scroll.maximum() - 1
+        self._message_revision = snapshot.revision
+        entries = [MessageEntry(
+            record.message_id,
+            record.sender_name,
+            record.text,
+            "Nearby room" if record.scope == "room" else "Direct",
+            self._message_state(record),
+            record.direction == "outgoing",
+            record.recorded_ms,
+        ) for record in snapshot.entries]
+        self.message_model.set_entries(entries)
+        if selected_id is not None:
+            row = next((index for index, entry in enumerate(entries)
+                        if entry.identifier == selected_id), -1)
+            if row >= 0:
+                self.message_view.setCurrentIndex(self.message_model.index(row, 0))
+        if entries and follow_latest:
+            self.message_view.scrollToBottom()
+        elif entries:
+            scroll.setValue(min(old_scroll, scroll.maximum()))
+
+    @staticmethod
+    def _message_state(record: MessageRecord) -> str:
+        """Summarize only locally observed delivery evidence."""
+        if record.direction == "incoming":
+            security = ("authenticated TLS" if record.authenticated
+                        else "unverified plaintext")
+            return f"Accepted by this application over {security}"
+        counts = {state: sum(delivery.state == state
+                             for delivery in record.deliveries)
+                  for state in ("queued", "accepted", "failed", "uncertain")}
+        parts = []
+        if counts["accepted"]:
+            authenticated = sum(
+                delivery.state == "accepted" and delivery.authenticated
+                for delivery in record.deliveries)
+            plaintext = counts["accepted"] - authenticated
+            if authenticated:
+                parts.append(
+                    f"{authenticated} accepted by receiving application over "
+                    "authenticated TLS")
+            if plaintext:
+                parts.append(
+                    f"{plaintext} accepted by receiving application over "
+                    "unverified plaintext")
+        if counts["failed"]:
+            parts.append(f"{counts['failed']} failed")
+        if counts["uncertain"]:
+            parts.append(f"{counts['uncertain']} uncertain")
+        if counts["queued"]:
+            parts.append(f"{counts['queued']} queued")
+        return "; ".join(parts) or "No recipient evidence"
 
     def append(self, text: str, category: str = "System",
                severity: str = "info") -> None:
@@ -1336,8 +1800,8 @@ class MainWindow(QMainWindow):
         devices = [AdminDevice(
             key=f"peer:{record.session_id}", label=record.hello.name,
             address=record.ip, source="LAN Atlas HELLO",
-            detail=(f"Recent unverified session; not authenticated · "
-                    f"{', '.join(record.hello.capabilities) or 'presence only'}"),
+            detail=(f"Recent session; {peer_trust_label(record)}; discovery not authenticated · "
+                     f"{', '.join(record.hello.capabilities) or 'presence only'}"),
             port=record.hello.tcp_port, capabilities=record.hello.capabilities,
             peer_id=record.hello.peer_id, session_id=record.session_id)
             for record in self.peer_records if record.nearby]
@@ -1464,15 +1928,11 @@ class MainWindow(QMainWindow):
                       for record in self.service.peer_repository.supporting("chat_v1")
                       if selected is None or record.session_id == selected)
         try:
-            identifier = self.service.send(text, peers, selected is not None)
+            self.service.send(text, peers, selected is not None)
         except (ValueError, RuntimeError) as error:
             self.append(str(error), "Messages", "warning")
             return
-        scope = "direct" if selected is not None else "nearby room"
-        self.message_model.append(MessageEntry(identifier, self.service.hello.name,
-                                               text, scope,
-                                               "Queued locally", True))
-        self.message_view.scrollToBottom()
+        self._refresh_messages()
         self.input.clear()
 
     @Slot()
@@ -1487,27 +1947,20 @@ class MainWindow(QMainWindow):
                 self._apply_repository_event(value)
             elif kind == "roster":
                 self._update_roster(tuple(value))
-            elif kind == "message":
-                name = self._peer_name(value["peer_id"], value["session_id"])
-                self.message_model.append(MessageEntry(
-                    value["message_id"], name, value["body"]["text"],
-                    value["body"]["scope"], "Accepted locally", False))
-                self.message_view.scrollToBottom()
-            elif kind == "message_outcome":
-                outcomes = self.message_outcomes.setdefault(value["message_id"], {})
-                outcomes[value["session_id"]] = value["state"]
-                accepted = sum(state == "accepted" for state in outcomes.values())
-                failed = sum(state == "failed" for state in outcomes.values())
-                state = f"Accepted by {accepted}; failed for {failed}"
-                self.message_model.update_state(value["message_id"], state)
             elif kind in {"transfer", "file_offer"}:
                 if kind == "file_offer":
                     value = {**value, "state": "offer_pending", "total": value["size"]}
+                    security = ("authenticated TLS" if value.get("authenticated")
+                                else "unverified plaintext")
                     self.append(
                         f"Incoming file offer {value['name']!r}, {value['size']} bytes "
-                        f"from unverified peer {value['peer_id'][:8]}…",
-                        "Transfers", "warning")
+                        f"from peer {value['peer_id'][:8]}… over {security}",
+                        "Transfers", "info" if value.get("authenticated") else "warning")
                 self.update_transfer(value)
+            elif kind == "pair_request":
+                self._show_pair_request(value)
+            elif kind == "pair_outbound":
+                self._show_pair_outbound(value)
             elif kind == "feed_updated":
                 suffix = "; more pages available" if value.get("partial") else ""
                 self.append(f"Feed sync: {value['added']} added, "
@@ -1533,9 +1986,12 @@ class MainWindow(QMainWindow):
                 self.append(text, "Network",
                             "warning" if any(word in text.lower()
                                              for word in ("failed", "stopped")) else "info")
+        self.service.flush_repository_events()
+        self._refresh_messages()
         now = time.monotonic()
         if now >= self._next_presence_refresh:
             self._next_presence_refresh = now + 1.0
+            self._refresh_portal_state()
             self.peer_model.refresh_ages()
             self.peer_table_model.refresh_ages()
             record = self._selected_record()
@@ -1558,6 +2014,9 @@ class MainWindow(QMainWindow):
     def _update_peer_records(self, records: tuple[PeerRecord, ...]) -> None:
         """Render one immutable repository snapshot across all peer surfaces."""
         previous_count = sum(record.nearby for record in self.peer_records)
+        previous_trust = {
+            record.hello.peer_id: record.trust_state
+            for record in self.peer_records}
         message_selected = self.recipient.currentData()
         feed_selected = self.feed_peer.currentData()
         self.peer_records = records
@@ -1582,8 +2041,12 @@ class MainWindow(QMainWindow):
         self.nearby_status.setText(f"{len(nearby)} sessions nearby")
         self.network_status.setText("Discovery active · application listener configured")
         stale_count = len(records) - len(nearby)
+        paired_count = sum(
+            record.trust_state is TrustState.PAIRED for record in records)
         self.footer_right.setText(
-            f"{len(nearby)} nearby · {stale_count} stale  ·  Unverified LAN")
+            f"{len(nearby)} nearby · {stale_count} stale · "
+            f"{paired_count} paired key(s) · Unverified LAN")
+        self._refresh_trust_summary()
         self.nearby_value.setText(str(len(nearby)) if nearby else "Searching...")
         capabilities = {item for record in nearby for item in record.hello.capabilities}
         self.capability_value.setText(str(len(capabilities)) if nearby else "Waiting")
@@ -1615,6 +2078,10 @@ class MainWindow(QMainWindow):
         names = {record.hello.peer_id: record.hello.name for record in records}
         names[self.service.hello.peer_id] = self.service.hello.name
         self.post_model.set_author_names(names)
+        current_trust = {
+            record.hello.peer_id: record.trust_state for record in records}
+        if current_trust != previous_trust:
+            self.refresh_feed()
 
     def _rebuild_message_recipients(self, selected: object) -> None:
         self.recipient.blockSignals(True)
@@ -1623,8 +2090,13 @@ class MainWindow(QMainWindow):
         for record in self.peer_records:
             if not record.nearby or "chat_v1" not in record.hello.capabilities:
                 continue
+            security = ("Paired TLS" if record.trust_state is TrustState.PAIRED
+                        else "Key changed; blocked"
+                        if record.trust_state is TrustState.KEY_CHANGED
+                        else "Legacy plaintext")
             self.recipient.addItem(
-                f"Direct · {record.hello.name} · {record.ip}", record.session_id)
+                f"Direct · {record.hello.name} · {record.ip} · {security}",
+                record.session_id)
         index = self.recipient.findData(selected)
         if selected is not None and index < 0:
             self.recipient.addItem("Selected session is no longer nearby", selected)
@@ -1638,8 +2110,13 @@ class MainWindow(QMainWindow):
         for record in self.peer_records:
             if not record.nearby or "posts_v1" not in record.hello.capabilities:
                 continue
+            security = ("Paired TLS" if record.trust_state is TrustState.PAIRED
+                        else "Key changed; blocked"
+                        if record.trust_state is TrustState.KEY_CHANGED
+                        else "Legacy plaintext")
             self.feed_peer.addItem(
-                f"{record.hello.name} · {record.ip}", record.session_id)
+                f"{record.hello.name} · {record.ip} · {security}",
+                record.session_id)
         index = self.feed_peer.findData(selected)
         self.feed_peer.setCurrentIndex(max(0, index))
 
@@ -1663,6 +2140,9 @@ class MainWindow(QMainWindow):
         self.overview_topology.select_session(selected)
         pill = state_pill_for(record)
         self.overview_state_pill.set_state(pill.state())
+        trust = trust_pill(record)
+        self.overview_trust_pill.set_state(trust.state())
+        self.overview_trust_pill.setText(trust.text())
         if record is None:
             self.overview_peer_name.setText("No session selected")
             for value in (self.overview_peer_endpoint,
@@ -1674,6 +2154,8 @@ class MainWindow(QMainWindow):
             self.overview_peer_caps.setText("Presence only")
             self.overview_peer_rtt.setText("Measured latency: none yet")
             self.overview_state_pill.setText("No selection")
+            self.overview_trust_pill.setToolTip(
+                "Select one session to inspect its stored key evidence.")
             self.network_selected_name.setText("No session selected")
             for value in (self.network_selected_endpoint,
                           self.network_selected_session):
@@ -1694,7 +2176,10 @@ class MainWindow(QMainWindow):
         self.overview_peer_installation.setToolTip(record.hello.peer_id)
         self.overview_peer_session.setText(f"{record.session_id[:12]}…")
         self.overview_peer_session.setToolTip(record.session_id)
-        self.overview_peer_state.setText(f"{pill_display_text(pill.state())} · Unverified")
+        trust_text = peer_trust_label(record)
+        self.overview_peer_state.setText(
+            f"{pill_display_text(pill.state())} · {trust_text}")
+        self.overview_trust_pill.setToolTip(self._trust_explanation(record))
         self.overview_peer_caps.setText("  ·  ".join(labels) or "Presence only")
         self.overview_state_pill.setText(pill.text())
         if record.latency_ms is None:
@@ -1711,7 +2196,7 @@ class MainWindow(QMainWindow):
         self.network_selected_session.setText(f"{record.session_id[:12]}…")
         self.network_selected_session.setToolTip(record.session_id)
         self.network_selected_state.setText(
-            f"{pill_display_text(pill.state())} · Unverified")
+            f"{pill_display_text(pill.state())} · {trust_text}")
         self.network_state_pill.set_state(pill.state())
         self.network_state_pill.setText(pill.text())
         self.network_selected_caps.setText("  ·  ".join(labels) or "Presence only")
@@ -1748,10 +2233,12 @@ class MainWindow(QMainWindow):
             self.peer_nearby_evidence.setText("○ Nearby        No session selected")
             self.peer_reachable_evidence.setText("○ Reachable     Not tested")
             self.peer_compatible_evidence.setText("○ Compatible    Not tested")
+            self.peer_trust_evidence.setText("◇ Paired key    Not established")
             for button in (self.peer_message_button, self.peer_file_button,
                            self.peer_sync_button, self.peer_ping_button,
                            self.peer_tcp_button, self.peer_copy_button,
-                           self.peer_probe_button):
+                           self.peer_probe_button, self.peer_pair_button,
+                           self.peer_forget_button):
                 button.setEnabled(False)
             return
         age = max(0.0, time.monotonic() - record.last_seen)
@@ -1798,15 +2285,37 @@ class MainWindow(QMainWindow):
         compatible = record.compatibility_state.value.replace("_", " ").title()
         self.peer_reachable_evidence.setText(f"○ Reachable     {reachable}")
         self.peer_compatible_evidence.setText(f"○ Compatible    {compatible}")
+        trust_text = peer_trust_label(record)
+        self.peer_trust_evidence.setText(f"◇ Paired key    {trust_text}")
+        fingerprint = record.hello.certificate_sha256
+        fingerprint_line = (
+            f"\nAdvertised certificate: {fingerprint}" if fingerprint is not None
+            else "\nNo certificate fingerprint advertised by this session.")
+        self.peer_warning.setText(
+            f"Cryptographic Trust: {trust_text}\n"
+            f"{self._trust_explanation(record)}{fingerprint_line}")
         live = record.nearby
+        secure_capable = "secure_transport_v1" in record.hello.capabilities
+        transport_allowed = (
+            record.trust_state is not TrustState.KEY_CHANGED
+            and (record.trust_state is not TrustState.PAIRED or secure_capable))
         self.peer_message_button.setEnabled(
-            live and "chat_v1" in record.hello.capabilities)
-        self.peer_file_button.setEnabled(live and "file_v1" in record.hello.capabilities)
-        self.peer_sync_button.setEnabled(live and "posts_v1" in record.hello.capabilities)
+            live and transport_allowed and "chat_v1" in record.hello.capabilities)
+        self.peer_file_button.setEnabled(
+            live and transport_allowed and "file_v1" in record.hello.capabilities)
+        self.peer_sync_button.setEnabled(
+            live and transport_allowed and "posts_v1" in record.hello.capabilities)
         self.peer_ping_button.setEnabled(live)
         self.peer_tcp_button.setEnabled(live)
         self.peer_copy_button.setEnabled(True)
         self.peer_probe_button.setEnabled(live)
+        self.peer_pair_button.setEnabled(
+            live and self.service.secure_transport is not None
+            and secure_capable
+            and record.trust_state is TrustState.UNVERIFIED)
+        self.peer_forget_button.setEnabled(
+            self.service.secure_transport is not None
+            and record.trust_state is not TrustState.UNVERIFIED)
 
     def _selected_record(self) -> PeerRecord | None:
         return self._record_in_snapshot(self.peer_selection.session_id)
@@ -1819,6 +2328,129 @@ class MainWindow(QMainWindow):
     def _selected_peer(self) -> Peer | None:
         record = self.service.peer_repository.get(self.peer_selection.session_id)
         return record.as_peer() if record is not None and record.nearby else None
+
+    @staticmethod
+    def _trust_explanation(record: PeerRecord) -> str:
+        """Describe stored trust separately from current connection evidence."""
+        secure_capable = "secure_transport_v1" in record.hello.capabilities
+        if record.trust_state is TrustState.KEY_CHANGED:
+            return (
+                "The advertised certificate differs from the pinned key. "
+                "Application connections are blocked; verify the device out-of-band "
+                "before forgetting the old key.")
+        if record.trust_state is TrustState.PAIRED:
+            if not secure_capable:
+                return (
+                    "A certificate is pinned, but this session does not advertise secure "
+                    "transport. Application connections are blocked without downgrade.")
+            return (
+                "A certificate is pinned. Each chat, feed, or file connection must still "
+                "authenticate that key over TLS; discovery is not authenticated.")
+        if secure_capable:
+            return (
+                "No authenticated device identity has been established. Until explicitly "
+                "paired, chat, feed, and file connections use legacy plaintext.")
+        return (
+            "No authenticated device identity has been established. This legacy session's "
+            "chat, feed, and file connections are plaintext.")
+
+    def _refresh_trust_summary(self) -> None:
+        transport = self.service.secure_transport
+        count = (len(transport.trust_store.snapshot().records)
+                 if transport is not None else 0)
+        self.settings_trust.setText(f"{count} pinned certificate(s)")
+
+    def _pair_selected_peer(self) -> None:
+        peer = self._selected_peer()
+        record = self._selected_record()
+        if (peer is None or record is None
+                or record.trust_state is not TrustState.UNVERIFIED
+                or "secure_transport_v1" not in record.hello.capabilities):
+            return
+        try:
+            queued = self.service.request_pair(peer)
+        except (RuntimeError, ValueError) as error:
+            self.append(f"Pairing request failed: {error}", "Security", "warning")
+            return
+        if queued:
+            self.append(
+                f"Pairing request queued for {record.hello.name}. Compare the code "
+                "shown on both devices before the remote user accepts.", "Security")
+
+    def _forget_selected_peer(self) -> None:
+        record = self._selected_record()
+        if (record is None
+                or record.trust_state is TrustState.UNVERIFIED):
+            return
+        answer = QMessageBox.question(
+            self, "Forget paired key",
+            f"Forget the pinned certificate for {record.hello.name}?\n\n"
+            "Future connections will be allowed over legacy plaintext until the device "
+            "is paired again.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            forgotten = self.service.forget_pair(record.hello.peer_id)
+        except (RuntimeError, ValueError) as error:
+            self.append(f"Could not forget paired key: {error}",
+                        "Security", "warning")
+            return
+        if forgotten:
+            self._refresh_trust_summary()
+            self.append(f"Forgot the pinned key for {record.hello.name}.",
+                        "Security", "warning")
+
+    def _show_pair_request(self, candidate: PairingCandidate) -> None:
+        answer = QMessageBox.question(
+            self, "Incoming pairing request",
+            f"{candidate.name} requests certificate pairing.\n\n"
+            f"Comparison code: {candidate.comparison_code}\n\n"
+            "Accept only after the same code is confirmed on the other device.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        try:
+            if answer == QMessageBox.StandardButton.Yes:
+                accepted = self.service.accept_pair(candidate.request_id)
+                self._refresh_trust_summary()
+                self.append(
+                    f"Pinned {accepted.name}'s certificate after explicit approval.",
+                    "Security")
+            else:
+                declined = self.service.decline_pair(candidate.request_id)
+                self.append(f"Declined pairing from {declined.name}.",
+                            "Security", "warning")
+        except (RuntimeError, SecureTransportError, ValueError) as error:
+            self.append(f"Pairing decision failed: {error}",
+                        "Security", "warning")
+
+    def _show_pair_outbound(self, candidate: PairingCandidate) -> None:
+        answer = QMessageBox.question(
+            self, "Pairing request sent",
+            f"Comparison code for {candidate.name}:\n\n"
+            f"{candidate.comparison_code}\n\n"
+            "Pin this certificate only after confirming the same code on the other "
+            "device. Its user must also accept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        try:
+            if answer == QMessageBox.StandardButton.Yes:
+                accepted = self.service.accept_outbound_pair(
+                    candidate.request_id)
+                self._refresh_trust_summary()
+                self.append(
+                    f"Pinned the selected certificate for {accepted.name}; remote "
+                    "approval is also required.", "Security")
+            else:
+                declined = self.service.decline_outbound_pair(
+                    candidate.request_id)
+                self.append(
+                    f"Did not pin the certificate for {declined.name}.",
+                    "Security", "warning")
+        except (RuntimeError, SecureTransportError, ValueError) as error:
+            self.append(f"Pairing approval failed: {error}",
+                        "Security", "warning")
 
     @Slot(str)
     @Slot(QAbstractButton, bool)
@@ -1934,13 +2566,15 @@ class MainWindow(QMainWindow):
 
     def _open_peer_admin(self) -> None:
         peer = self._selected_peer()
-        if peer is None:
+        record = self._selected_record()
+        if peer is None or record is None:
             return
         self.admin_address.setText(peer.ip)
         self.admin_port.setValue(peer.hello.tcp_port)
         self.admin_selection.setText(
             f"{peer.hello.name} · LAN Atlas HELLO\n"
-            "Endpoint is observed and advertised, not authenticated.")
+            f"Endpoint is observed and advertised · {peer_trust_label(record)}. "
+            "The discovery observation itself is not authenticated.")
         key = f"peer:{peer.hello.session_id}"
         row = next((index for index, device in enumerate(self.admin_device_model.devices)
                     if device.key == key), -1)
@@ -2033,6 +2667,14 @@ class MainWindow(QMainWindow):
                 f"{human_bytes(rate)}/s · ETA {format_eta(row.get('_eta'))}")
         else:
             self.transfer_rate.setText("Rate not measured")
+        if row.get("state") not in {"preparing", "hashing"}:
+            if not row.get("connected", True):
+                security = "No application connection established"
+            else:
+                security = ("Authenticated TLS" if row.get("authenticated")
+                            else "Unverified plaintext")
+            self.transfer_rate.setText(
+                f"{self.transfer_rate.text()} · {security}")
         pending_offer = row.get("state") == "offer_pending"
         terminal = row.get("state") in TERMINAL_TRANSFERS
         self.accept_file.setEnabled(pending_offer)
@@ -2147,13 +2789,39 @@ class MainWindow(QMainWindow):
         names = {record.hello.peer_id: record.hello.name
                  for record in self.service.peer_repository.snapshot()}
         names[self.service.hello.peer_id] = self.service.hello.name
-        self.post_model.set_posts(posts, self.service.hello.peer_id, names)
-        lines = [f"{names.get(post['author_id'], post['author_id'])} | {post['text']}"
+        security_labels = {
+            post["post_id"]: self._post_security_label(post) for post in posts}
+        self.post_model.set_posts(
+            posts, self.service.hello.peer_id, names, security_labels)
+        lines = [f"{names.get(post['author_id'], post['author_id'])} | "
+                 f"{security_labels[post['post_id']]} | {post['text']}"
                  for post in posts]
         self.feed_log.setPlainText("\n\n".join(lines) if lines else "No cached posts.")
+
+    def _post_security_label(self, post: dict[str, Any]) -> str:
+        """Describe signature and pairing evidence without trusting embedded keys."""
+        verification = verify_post(post)
+        if verification.state == "unsigned":
+            return "Unsigned legacy post"
+        if verification.state == "invalid":
+            return "Invalid signature"
+        transport = self.service.secure_transport
+        if transport is None:
+            return "Valid signature · author not paired"
+        if post["author_id"] == self.service.hello.peer_id:
+            if verification.fingerprint == transport.identity.fingerprint:
+                return "Signed by this device"
+            return "Signature key differs from this device"
+        record = transport.trust_store.get(post["author_id"])
+        if record is None:
+            return "Valid signature · author not paired"
+        if verification.fingerprint == record.fingerprint:
+            return "Signature matches paired key"
+        return "Signature key differs from paired key"
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Cancel core work; the entry point joins after the Qt loop exits."""
         self.timer.stop()
+        self.portal.stop()
         self.service.stop()
         event.accept()

@@ -64,6 +64,16 @@ def build_stylesheet() -> str:
             border: 1px solid {COLORS["on-tertiary-fixed-variant"]};
             background: {COLORS["surface-container-low"]};
         }}
+        QLabel#StatusPill[state="paired"] {{
+            color: {COLORS["secondary"]};
+            border: 1px solid {COLORS["secondary"]};
+            background: {COLORS["surface-container-low"]};
+        }}
+        QLabel#StatusPill[state="key_changed"] {{
+            color: {COLORS["error"]};
+            border: 1px solid {COLORS["error"]};
+            background: {COLORS["surface-container-low"]};
+        }}
         QLabel#StatusPill[state="offline"] {{
             color: {COLORS["outline"]};
             border: 1px dashed {COLORS["outline-variant"]};

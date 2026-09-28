@@ -77,8 +77,8 @@ class TopBar(QFrame):
         self.security.setProperty("security", True)
         self.security.setProperty("state", "unverified")
         self.security.setToolTip(
-            "Peer names and IDs are self-reported. "
-            "Traffic is not authenticated or encrypted.")
+            "Discovery remains self-reported. Trust and authenticated TLS are "
+            "established separately for each explicitly paired device.")
         self.security.setSizePolicy(QSizePolicy.Policy.Fixed,
                                     QSizePolicy.Policy.Fixed)
         layout.addWidget(self.security)

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QLabel
 
-_VALID_STATES = ("reachable", "compatible", "nearby", "unverified", "offline")
+_VALID_STATES = (
+    "reachable", "compatible", "nearby", "unverified", "paired",
+    "key_changed", "offline",
+)
 
 
 class StatusPill(QLabel):
