@@ -14,6 +14,7 @@ from m1_discovery import load_identity, run
 
 PEER = "00000000-0000-4000-8000-000000000001"
 SESSION = "00000000-0000-4000-8000-000000000002"
+FINGERPRINT = "0123456789abcdef" * 4
 GOLDEN = (b'LMAN\x01{"version":1,"peer_id":"00000000-0000-4000-8000-000000000001",'
           b'"session_id":"00000000-0000-4000-8000-000000000002",'
           b'"name":"Alice","tcp_port":50001,"capabilities":[]}')
@@ -23,6 +24,91 @@ def test_golden_packet() -> None:
     hello = Hello(PEER, SESSION, "Alice")
     assert encode_hello(hello) == GOLDEN
     assert decode_hello(GOLDEN) == hello
+    assert hello.secure_port is None
+    assert hello.certificate_sha256 is None
+
+
+def test_secure_transport_round_trip() -> None:
+    hello = Hello(
+        PEER, SESSION, "Alice", 50001, ("chat_v1", "secure_transport_v1"),
+        54443, FINGERPRINT,
+    )
+    packet = encode_hello(hello)
+
+    assert decode_hello(packet) == hello
+    assert json.loads(packet[len(HEADER):]) == {
+        "version": 1,
+        "peer_id": PEER,
+        "session_id": SESSION,
+        "name": "Alice",
+        "tcp_port": 50001,
+        "capabilities": ["chat_v1", "secure_transport_v1"],
+        "secure_port": 54443,
+        "certificate_sha256": FINGERPRINT,
+    }
+
+
+@pytest.mark.parametrize("secure_port", [True, 0, 65536, 443.0, "443"])
+def test_bad_secure_port(secure_port: object) -> None:
+    data = json.loads(GOLDEN[5:])
+    data.update({
+        "capabilities": ["secure_transport_v1"],
+        "secure_port": secure_port,
+        "certificate_sha256": FINGERPRINT,
+    })
+
+    with pytest.raises(DiscoveryError):
+        decode_hello(HEADER + json.dumps(data).encode())
+
+
+@pytest.mark.parametrize("fingerprint", [
+    "a" * 63,
+    "a" * 65,
+    "A" * 64,
+    "g" * 64,
+    1,
+])
+def test_bad_certificate_fingerprint(fingerprint: object) -> None:
+    data = json.loads(GOLDEN[5:])
+    data.update({
+        "capabilities": ["secure_transport_v1"],
+        "secure_port": 54443,
+        "certificate_sha256": fingerprint,
+    })
+
+    with pytest.raises(DiscoveryError):
+        decode_hello(HEADER + json.dumps(data).encode())
+
+
+@pytest.mark.parametrize("key,value", [
+    ("secure_port", 54443),
+    ("certificate_sha256", FINGERPRINT),
+])
+def test_incomplete_secure_transport_metadata(key: str, value: object) -> None:
+    data = json.loads(GOLDEN[5:])
+    data["capabilities"] = ["secure_transport_v1"]
+    data[key] = value
+
+    with pytest.raises(DiscoveryError):
+        decode_hello(HEADER + json.dumps(data).encode())
+
+
+def test_secure_transport_metadata_requires_capability() -> None:
+    hello = Hello(
+        PEER, SESSION, "Alice", 50001, (), 54443, FINGERPRINT,
+    )
+
+    with pytest.raises(DiscoveryError):
+        encode_hello(hello)
+
+
+def test_secure_transport_capability_requires_metadata() -> None:
+    hello = Hello(
+        PEER, SESSION, "Alice", 50001, ("secure_transport_v1",),
+    )
+
+    with pytest.raises(DiscoveryError):
+        encode_hello(hello)
 
 
 def test_unicode_and_optional_field() -> None:

@@ -32,6 +32,8 @@ class Hello:
     name: str
     tcp_port: int = TCP_PORT
     capabilities: tuple[str, ...] = ()
+    secure_port: int | None = None
+    certificate_sha256: str | None = None
 
 
 def _validate(value: object) -> Hello:
@@ -61,8 +63,26 @@ def _validate(value: object) -> Hello:
            or not item.isascii() or not all(c.isalnum() or c in "_-" for c in item)
            for item in capabilities):
         raise DiscoveryError("invalid capability")
+    has_secure_port = "secure_port" in value
+    has_certificate = "certificate_sha256" in value
+    if has_secure_port != has_certificate:
+        raise DiscoveryError("incomplete secure transport metadata")
+    has_capability = "secure_transport_v1" in capabilities
+    if has_capability != has_secure_port:
+        raise DiscoveryError(
+            "secure transport capability and metadata must appear together")
+    secure_port = value.get("secure_port")
+    certificate_sha256 = value.get("certificate_sha256")
+    if has_secure_port:
+        if type(secure_port) is not int or not 1 <= secure_port <= 65535:
+            raise DiscoveryError("invalid secure port")
+        if (not isinstance(certificate_sha256, str)
+                or len(certificate_sha256) != 64
+                or any(character not in "0123456789abcdef"
+                       for character in certificate_sha256)):
+            raise DiscoveryError("invalid certificate fingerprint")
     return Hello(value["peer_id"], value["session_id"], name, port,
-                 tuple(capabilities))
+                 tuple(capabilities), secure_port, certificate_sha256)
 
 
 def encode_hello(hello: Hello) -> bytes:
@@ -70,6 +90,10 @@ def encode_hello(hello: Hello) -> bytes:
     value = {"version": 1, "peer_id": hello.peer_id,
              "session_id": hello.session_id, "name": hello.name,
              "tcp_port": hello.tcp_port, "capabilities": list(hello.capabilities)}
+    if hello.secure_port is not None:
+        value["secure_port"] = hello.secure_port
+    if hello.certificate_sha256 is not None:
+        value["certificate_sha256"] = hello.certificate_sha256
     _validate(value)
     try:
         packet = HEADER + json.dumps(value, ensure_ascii=False,
