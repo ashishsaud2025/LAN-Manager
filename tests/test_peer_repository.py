@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from uuid import uuid4
+
+import pytest
 
 from core.diagnostics import Neighbor, NeighborSnapshot, ProbeResult
 from core.discovery import Hello
@@ -12,10 +15,36 @@ from core.roster import Peer
 
 
 def _peer(name: str = "Peer", address: str = "192.168.1.20",
-          peer_id: str | None = None) -> Peer:
+          peer_id: str | None = None,
+          certificate_sha256: str | None = None) -> Peer:
+    capabilities = ["chat_v1", "echo_v1"]
+    if certificate_sha256 is not None:
+        capabilities.append("secure_transport_v1")
     hello = Hello(peer_id or str(uuid4()), str(uuid4()), name, 50001,
-                  ("chat_v1", "echo_v1"))
+                  tuple(capabilities),
+                  50002 if certificate_sha256 is not None else None,
+                  certificate_sha256)
     return Peer(hello, address, 10.0)
+
+
+class _FakeTrustResolver:
+    def __init__(self) -> None:
+        self.fingerprints: dict[str, str] = {}
+
+    def pair(self, hello: Hello) -> None:
+        assert hello.certificate_sha256 is not None
+        self.fingerprints[hello.peer_id] = hello.certificate_sha256
+
+    def forget(self, hello: Hello) -> None:
+        self.fingerprints.pop(hello.peer_id, None)
+
+    def __call__(self, hello: Hello) -> TrustState:
+        expected = self.fingerprints.get(hello.peer_id)
+        if expected is None:
+            return TrustState.UNVERIFIED
+        if hello.certificate_sha256 == expected:
+            return TrustState.PAIRED
+        return TrustState.KEY_CHANGED
 
 
 def test_presence_creates_refreshes_and_stales_one_session() -> None:
@@ -39,6 +68,96 @@ def test_presence_creates_refreshes_and_stales_one_session() -> None:
     assert record is not None
     assert record.discovery_state is DiscoveryState.STALE
     assert repository.nearby() == ()
+
+
+def test_trust_resolver_projects_paired_state_without_authentication() -> None:
+    resolver = _FakeTrustResolver()
+    peer = _peer(certificate_sha256="a" * 64)
+    resolver.pair(peer.hello)
+    repository = PeerRepository(trust_resolver=resolver)
+
+    repository.reconcile_presence((peer,), 10)
+
+    record = repository.get(peer.hello.session_id)
+    assert record is not None
+    assert record.trust_state is TrustState.PAIRED
+
+
+def test_trust_resolver_projects_changed_fingerprint() -> None:
+    resolver = _FakeTrustResolver()
+    peer = _peer(certificate_sha256="a" * 64)
+    resolver.pair(peer.hello)
+    repository = PeerRepository(trust_resolver=resolver)
+    repository.reconcile_presence((peer,), 10)
+
+    changed = Peer(
+        replace(peer.hello, certificate_sha256="b" * 64), peer.ip, 11)
+    repository.reconcile_presence((changed,), 11)
+
+    record = repository.get(peer.hello.session_id)
+    assert record is not None
+    assert record.trust_state is TrustState.KEY_CHANGED
+
+
+def test_refresh_trust_updates_only_trust_evidence() -> None:
+    resolver = _FakeTrustResolver()
+    peer = _peer(certificate_sha256="a" * 64)
+    repository = PeerRepository(trust_resolver=resolver)
+    repository.reconcile_presence((peer,), 10)
+    repository.apply_neighbor_snapshot(NeighborSnapshot(
+        "neighbors", (Neighbor(peer.ip, "00:11:22:33:44:55", None, "stale"),),
+        "OS neighbor cache"))
+    before = repository.get(peer.hello.session_id)
+    assert before is not None
+
+    resolver.pair(peer.hello)
+    event = repository.refresh_trust()
+
+    assert event is not None
+    assert event.updated == (peer.hello.session_id,)
+    assert repository.get(peer.hello.session_id) == replace(
+        before, trust_state=TrustState.PAIRED)
+    assert repository.refresh_trust() is None
+
+
+def test_stale_retention_refreshes_current_trust_state() -> None:
+    resolver = _FakeTrustResolver()
+    peer = _peer(certificate_sha256="a" * 64)
+    resolver.pair(peer.hello)
+    repository = PeerRepository(stale_retention=30, trust_resolver=resolver)
+    repository.reconcile_presence((peer,), 10)
+    repository.reconcile_presence((), 11)
+
+    resolver.forget(peer.hello)
+    event = repository.refresh_trust()
+
+    record = repository.get(peer.hello.session_id)
+    assert event is not None
+    assert record is not None
+    assert record.discovery_state is DiscoveryState.STALE
+    assert record.stale_since == 11
+    assert record.trust_state is TrustState.UNVERIFIED
+
+
+def test_default_trust_resolver_remains_unverified() -> None:
+    peer = _peer(certificate_sha256="a" * 64)
+    repository = PeerRepository()
+
+    repository.reconcile_presence((peer,), 10)
+
+    record = repository.get(peer.hello.session_id)
+    assert record is not None
+    assert record.trust_state is TrustState.UNVERIFIED
+    assert repository.refresh_trust() is None
+
+
+def test_invalid_trust_resolver_result_is_rejected() -> None:
+    repository = PeerRepository(
+        trust_resolver=lambda _hello: "paired")  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="trust_resolver must return TrustState"):
+        repository.reconcile_presence((_peer(),), 10)
+    assert repository.snapshot() == ()
 
 
 def test_stale_retention_reappearance_and_purge_are_deterministic() -> None:

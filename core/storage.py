@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from core.post_signatures import verify_post
 from core.posts import page_posts, sort_key, validate_post
 
 SCHEMA_VERSION = 1
@@ -61,12 +62,12 @@ class JsonLinesPostStore(PostStore):
             for line in stream:
                 if not line.strip():
                     continue
-                post = validate_post(json.loads(line))
+                post = _validated_storable_post(json.loads(line))
                 self._posts.setdefault(post["post_id"], post)
 
     def add(self, post: dict[str, Any]) -> bool:
         """Validate, append, and fsync one post; duplicates report False."""
-        validated = deepcopy(validate_post(post))
+        validated = deepcopy(_validated_storable_post(post))
         with self._lock:
             if validated["post_id"] in self._posts:
                 return False
@@ -91,3 +92,11 @@ class JsonLinesPostStore(PostStore):
     def count(self) -> int:
         with self._lock:
             return len(self._posts)
+
+
+def _validated_storable_post(post: dict[str, Any]) -> dict[str, Any]:
+    validated = validate_post(post)
+    verification = verify_post(validated)
+    if verification.state == "invalid":
+        raise ValueError(f"invalid signed post: {verification.reason}")
+    return validated

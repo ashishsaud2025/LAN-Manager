@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 import math
@@ -40,9 +41,11 @@ class CompatibilityState(Enum):
 
 
 class TrustState(Enum):
-    """Cryptographic identity state; pairing is not implemented yet."""
+    """Stored pairing evidence for an advertised cryptographic identity."""
 
     UNVERIFIED = "unverified"
+    PAIRED = "paired"
+    KEY_CHANGED = "key_changed"
 
 
 @dataclass(frozen=True)
@@ -118,13 +121,16 @@ class PeerRepository:
     """Retain bounded, session-keyed peer evidence independently of the UI."""
 
     def __init__(self, stale_retention: float = STALE_RETENTION,
-                 max_retained: int = MAX_RETAINED_PEERS) -> None:
+                 max_retained: int = MAX_RETAINED_PEERS,
+                 trust_resolver: Callable[[Hello], TrustState] | None = None) -> None:
         if not math.isfinite(stale_retention) or stale_retention <= 0:
             raise ValueError("stale_retention must be finite and positive")
         if max_retained <= 0:
             raise ValueError("max_retained must be positive")
         self.stale_retention = stale_retention
         self.max_retained = max_retained
+        self._trust_resolver = (
+            _unverified_trust if trust_resolver is None else trust_resolver)
         self._records: dict[str, PeerRecord] = {}
         self._pending_probes: dict[str, _PendingProbe] = {}
         self._revision = 0
@@ -134,10 +140,12 @@ class PeerRepository:
         """Apply one complete active-roster snapshot and retain expired sessions."""
         if not math.isfinite(now):
             raise ValueError("now must be finite")
+        resolved_peers = tuple(
+            (peer, self._resolve_trust(peer.hello)) for peer in peers)
         with self._lock:
             before = dict(self._records)
             active_ids = {peer.hello.session_id for peer in peers}
-            for peer in peers:
+            for peer, trust_state in resolved_peers:
                 previous = self._records.get(peer.hello.session_id)
                 same_endpoint = (previous is not None
                                  and previous.ip == peer.ip
@@ -154,8 +162,8 @@ class PeerRepository:
                                         else ReachabilityState.UNKNOWN),
                     compatibility_state=(previous.compatibility_state
                                          if same_endpoint and same_capabilities
-                                           else CompatibilityState.UNKNOWN),
-                    trust_state=TrustState.UNVERIFIED,
+                                            else CompatibilityState.UNKNOWN),
+                    trust_state=trust_state,
                     stale_since=None,
                     hostname=previous.hostname if previous else None,
                     platform=previous.platform if previous else None,
@@ -172,6 +180,21 @@ class PeerRepository:
                         record, discovery_state=DiscoveryState.STALE,
                         stale_since=now)
             self._purge_stale(now)
+            return self._event(before)
+
+    def refresh_trust(self) -> PeerRepositoryEvent | None:
+        """Recompute pairing evidence for all retained sessions."""
+        with self._lock:
+            resolved = {
+                session_id: self._resolve_trust(record.hello)
+                for session_id, record in self._records.items()
+            }
+            before = dict(self._records)
+            for session_id, trust_state in resolved.items():
+                record = self._records[session_id]
+                if record.trust_state is not trust_state:
+                    self._records[session_id] = replace(
+                        record, trust_state=trust_state)
             return self._event(before)
 
     def apply_neighbor_snapshot(self, snapshot: NeighborSnapshot) -> PeerRepositoryEvent | None:
@@ -325,6 +348,16 @@ class PeerRepository:
         records = tuple(self._records.values())
         return (tuple(record for record in records if record.nearby)
                 + tuple(record for record in records if not record.nearby))
+
+    def _resolve_trust(self, hello: Hello) -> TrustState:
+        trust_state = self._trust_resolver(hello)
+        if not isinstance(trust_state, TrustState):
+            raise TypeError("trust_resolver must return TrustState")
+        return trust_state
+
+
+def _unverified_trust(_hello: Hello) -> TrustState:
+    return TrustState.UNVERIFIED
 
 
 def _valid_latency(value: float | int | None) -> bool:

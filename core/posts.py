@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 from typing import Any
 from uuid import UUID
 
@@ -9,6 +11,46 @@ MAX_POST_TEXT = 4096
 MAX_REFS = 8
 MAX_REF_NAME = 255
 PAGE_LIMIT_MAX = 50
+POST_SECURITY_VERSION = 1
+POST_SECURITY_ALGORITHM = "ecdsa-p256-sha256"
+MAX_POST_CERTIFICATE_DER = 16 * 1024
+MAX_POST_SIGNATURE_DER = 256
+
+
+def _validate_base64_der(value: object, name: str, maximum: int) -> None:
+    """Require bounded canonical base64 without interpreting its DER value."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"post security {name} must be base64 text")
+    maximum_encoded = 4 * ((maximum + 2) // 3)
+    if len(value) > maximum_encoded:
+        raise ValueError(f"post security {name} exceeds allowed size")
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"post security {name} is not strict base64") from exc
+    if not raw or len(raw) > maximum:
+        raise ValueError(f"post security {name} exceeds allowed size")
+    if base64.b64encode(raw).decode("ascii") != value:
+        raise ValueError(f"post security {name} is not canonical base64")
+
+
+def _validate_security(security: object) -> None:
+    """Validate signed-post metadata without assigning trust to its certificate."""
+    if not isinstance(security, dict):
+        raise ValueError("post security must be an object")
+    expected = {"version", "algorithm", "certificate", "signature"}
+    if set(security) != expected:
+        raise ValueError("post security has invalid fields")
+    if type(security["version"]) is not int or security["version"] != POST_SECURITY_VERSION:
+        raise ValueError("unsupported post security version")
+    if security["algorithm"] != POST_SECURITY_ALGORITHM:
+        raise ValueError("unsupported post security algorithm")
+    _validate_base64_der(
+        security["certificate"], "certificate", MAX_POST_CERTIFICATE_DER
+    )
+    _validate_base64_der(
+        security["signature"], "signature", MAX_POST_SIGNATURE_DER
+    )
 
 
 def _check_uuid(value: object, name: str) -> str:
@@ -47,6 +89,12 @@ def validate_post(post: dict[str, Any]) -> dict[str, Any]:
     """Validate an immutable post dict before storage or sync."""
     if not isinstance(post, dict):
         raise ValueError("post must be an object")
+    required = {"post_id", "author_id", "text", "created_ms"}
+    allowed = required | {"refs", "security"}
+    if not required.issubset(post):
+        raise ValueError("post has invalid fields")
+    if "security" in post and not set(post).issubset(allowed):
+        raise ValueError("post has invalid fields")
     _check_uuid(post.get("post_id"), "post_id")
     _check_uuid(post.get("author_id"), "author_id")
     text = post.get("text")
@@ -60,6 +108,8 @@ def validate_post(post: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("post refs must be a list of at most 8 items")
     for ref in refs:
         validate_ref(ref)
+    if "security" in post:
+        _validate_security(post["security"])
     return post
 
 

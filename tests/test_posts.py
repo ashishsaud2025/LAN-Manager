@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -97,3 +98,16 @@ def test_store_isolates_mutable_post_values(tmp_path: Path) -> None:
     assert fetched is not None
     fetched["text"] = "changed return"
     assert store.get(post["post_id"])["text"] == "hello"
+
+
+def test_store_loads_legacy_unsigned_extension_fields(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.jsonl"
+    post = _post()
+    post["legacy_extension"] = {"value": 1}
+    path.write_text(
+        json.dumps({"schema": 1}) + "\n" + json.dumps(post) + "\n",
+        encoding="utf-8")
+
+    store = JsonLinesPostStore(path)
+
+    assert store.get(post["post_id"]) == post

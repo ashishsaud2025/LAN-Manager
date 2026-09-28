@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import select
 import socket
+import ssl
 import tempfile
 import threading
 import time
@@ -24,6 +25,7 @@ from core.protocol import (
     validate_envelope,
 )
 from core.roster import Peer
+from core.secure_transport import SecureTransportError
 
 CHUNK_SIZE = 64 * 1024
 MAX_TRANSFERS = 4
@@ -73,27 +75,40 @@ class Transfer:
     conn: socket.socket | None = None
     thread: threading.Thread | None = None
     last_progress: float = 0
+    authenticated: bool = False
+    connected: bool = False
 
 
 class TransferService:
     """Limit active transfers and publish UI-independent lifecycle events."""
 
     def __init__(self, hello: Hello,
-                 emit: Callable[[str, Any], bool]) -> None:
+                 emit: Callable[[str, Any], bool],
+                 connector: Callable[[Peer], tuple[socket.socket, bool]]
+                 | None = None,
+                 observe_socket: Callable[[socket.socket, bool], object]
+                 | None = None) -> None:
         self.hello = hello
         self.emit = emit
+        self.connector = connector or self._connect_plaintext
+        self.observe_socket = observe_socket
         self._lock = threading.Lock()
         self._transfers: dict[str, Transfer] = {}
         self._stopped = False
 
     def _launch(self, identifier: str, action: Callable[[Transfer], None],
-                conn: socket.socket | None = None) -> None:
+                 conn: socket.socket | None = None,
+                 authenticated: bool = False) -> None:
         with self._lock:
             if self._stopped or len(self._transfers) >= MAX_TRANSFERS:
                 raise TransferError("transfer limit reached or service stopped")
             if identifier in self._transfers:
                 raise TransferError("duplicate active transfer ID")
-            transfer = Transfer(identifier, conn=conn)
+            transfer = Transfer(identifier, conn=conn,
+                                authenticated=authenticated,
+                                connected=conn is not None)
+            if conn is not None and self.observe_socket is not None:
+                self.observe_socket(conn, True)
             transfer.thread = threading.Thread(target=self._execute,
                                                args=(transfer, action), daemon=True)
             self._transfers[identifier] = transfer
@@ -102,12 +117,14 @@ class TransferService:
     def _execute(self, transfer: Transfer, action: Callable[[Transfer], None]) -> None:
         try:
             action(transfer)
-        except (OSError, ProtocolError, ValueError) as error:
+        except (OSError, ProtocolError, SecureTransportError, ValueError) as error:
             state = "cancelled" if transfer.cancel.is_set() else "failed"
             self._status(transfer, state, message=str(error))
         finally:
             if transfer.conn is not None:
                 transfer.conn.close()
+                if self.observe_socket is not None:
+                    self.observe_socket(transfer.conn, False)
             with self._lock:
                 self._transfers.pop(transfer.identifier, None)
 
@@ -119,11 +136,13 @@ class TransferService:
         self._launch(identifier, lambda transfer: self._send(transfer, path, peer))
         return identifier
 
-    def receive(self, conn: socket.socket, message: dict[str, Any]) -> None:
+    def receive(self, conn: socket.socket, message: dict[str, Any],
+                authenticated: bool = False) -> None:
         """Take ownership of an offer connection only after successful admission."""
         body = validate_offer(message, self.hello.session_id)
         self._launch(body["transfer_id"],
-                     lambda transfer: self._receive(transfer, message), conn)
+                     lambda transfer: self._receive(transfer, message), conn,
+                     authenticated)
 
     def decide(self, identifier: str, destination: Path | None) -> bool:
         """Accept with an explicit new destination, or decline with None."""
@@ -176,7 +195,9 @@ class TransferService:
             raise TransferError("transfer cancelled")
 
     def _status(self, transfer: Transfer, state: str, **values: Any) -> None:
-        self.emit("transfer", {"id": transfer.identifier, "state": state, **values})
+        self.emit("transfer", {"id": transfer.identifier, "state": state,
+                               "authenticated": transfer.authenticated,
+                               "connected": transfer.connected, **values})
 
     def _progress(self, transfer: Transfer, state: str, count: int, total: int) -> None:
         now = time.monotonic()
@@ -221,7 +242,10 @@ class TransferService:
         with path.open("rb") as stream:
             size, digest = self._hash(transfer, stream)
             stream.seek(0)
-            transfer.conn = socket.create_connection((peer.ip, peer.hello.tcp_port), timeout=3)
+            transfer.conn, transfer.authenticated = self.connector(peer)
+            transfer.connected = True
+            if self.observe_socket is not None:
+                self.observe_socket(transfer.conn, True)
             offer = envelope("FILE_OFFER", self.hello.peer_id, self.hello.session_id,
                              {"transfer_id": transfer.identifier, "name": path.name,
                               "size": size, "sha256": digest,
@@ -287,6 +311,9 @@ class TransferService:
             except (OSError, ValueError):
                 raise TransferError("sender disconnected during offer")
             if readable:
+                if isinstance(conn, ssl.SSLSocket):
+                    raise TransferError(
+                        "sender disconnected or sent unexpected data during offer")
                 try:
                     probe = conn.recv(1, socket.MSG_PEEK)
                 except OSError as error:
@@ -314,7 +341,8 @@ class TransferService:
         temporary: Path | None = None
         try:
             if not self.emit("file_offer", {"id": transfer.identifier, "name": body["name"],
-                                           "size": body["size"], "peer_id": offer["peer_id"]}):
+                                           "size": body["size"], "peer_id": offer["peer_id"],
+                                           "authenticated": transfer.authenticated}):
                 raise TransferError("offer queue full")
             try:
                 self._wait_decision(transfer)
@@ -382,3 +410,8 @@ class TransferService:
                     temporary.unlink()
                 except OSError as error:
                     logging.error("Cannot remove transfer temporary file %s: %s", temporary, error)
+
+    @staticmethod
+    def _connect_plaintext(peer: Peer) -> tuple[socket.socket, bool]:
+        return (socket.create_connection(
+            (peer.ip, peer.hello.tcp_port), timeout=3), False)

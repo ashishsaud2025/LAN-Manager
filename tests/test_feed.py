@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -7,8 +9,8 @@ import pytest
 
 from core.feed import merge_page, serve_query
 from core.posts import validate_post
-from core.protocol import ProtocolError, envelope, validate_envelope
-from core.storage import JsonLinesPostStore
+from core.protocol import ProtocolError, encode_message, envelope, validate_envelope
+from core.storage import JsonLinesPostStore, PostStore
 
 
 def _post(author: str | None = None, text: str = "hello") -> dict[str, object]:
@@ -79,3 +81,38 @@ def test_empty_page_must_be_complete() -> None:
     with pytest.raises(ProtocolError):
         validate_envelope(envelope("POST_PAGE", peer, session, {"posts": [],
             "next_cursor": None, "complete": False}, str(uuid4())))
+
+
+def test_signed_post_page_is_bounded_by_encoded_bytes() -> None:
+    author = str(uuid4())
+    certificate = base64.b64encode(b"x" * (16 * 1024)).decode("ascii")
+    signature = base64.b64encode(b"y" * 256).decode("ascii")
+    posts = []
+    for index in range(50):
+        post = _post(author, f"post {index}")
+        post["security"] = {
+            "version": 1,
+            "algorithm": "ecdsa-p256-sha256",
+            "certificate": certificate,
+            "signature": signature,
+        }
+        posts.append(post)
+
+    class LargePageStore(PostStore):
+        def page(self, limit: int, cursor: dict[str, object] | None = None,
+                 author_id: str | None = None) -> tuple[
+                     list[dict[str, object]], dict[str, object], bool]:
+            del limit, cursor, author_id
+            last = posts[-1]
+            return posts, {"last_author": last["author_id"],
+                           "last_post": last["post_id"]}, True
+
+    body = serve_query(
+        LargePageStore(), {"cursor": None, "limit": 50, "author_id": None})
+    assert 0 < len(body["posts"]) < 50
+    assert body["complete"] is False
+    assert body["next_cursor"]["last_post"] == body["posts"][-1]["post_id"]
+    message = envelope(
+        "POST_PAGE", str(uuid4()), str(uuid4()), body, str(uuid4()))
+    assert len(encode_message(message)) < 1024 * 1024 + 4
+    assert len(json.dumps(body).encode("utf-8")) < 1024 * 1024
