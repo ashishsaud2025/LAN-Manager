@@ -73,6 +73,11 @@ def main(runner: Callable[[Hello, DiscoveryTransport], None] = run) -> int:
                         default=root / "lan-manager" / "peer-id")
     parser.add_argument("--reuse-address", action="store_true",
                         help="opt in to OS-dependent same-host UDP sharing")
+    parser.add_argument("--source-address", action="append", default=None,
+                        help="also announce from one local IPv4 address; repeatable "
+                             "unless --no-fallback is given")
+    parser.add_argument("--no-fallback", action="store_true",
+                        help="do not also announce through the OS default route")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     transport = None
@@ -80,8 +85,10 @@ def main(runner: Callable[[Hello, DiscoveryTransport], None] = run) -> int:
         hello = Hello(load_identity(args.identity_file), str(uuid4()),
                       args.name, args.tcp_port)
         encode_hello(hello)
+        sources = tuple(args.source_address) if args.source_address else None
         transport = DiscoveryTransport(hello.session_id, args.port,
-                                       args.broadcast, args.reuse_address)
+                                       args.broadcast, args.reuse_address,
+                                       sources, not args.no_fallback)
         print(f"Discovery listening on UDP {args.port}; session={hello.session_id}. "
               "TCP port is advertised only; M1 does not start a TCP service.",
               flush=True)

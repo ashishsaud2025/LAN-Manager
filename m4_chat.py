@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 from uuid import uuid4
 
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from core.chat import ChatService
@@ -19,6 +20,34 @@ from core.storage import JsonLinesPostStore
 from core.trust import TrustStore
 from gui.main_window import MainWindow
 from m1_discovery import load_identity, port_number
+
+
+def _saved_discovery_selection() -> tuple[tuple[str, ...] | None, bool]:
+    """Return persisted announcement egress without starting Qt networking."""
+    from ipaddress import ip_address as _ip_address
+    try:
+        settings = QSettings("LAN Manager", "LAN Atlas")
+        saved_address = settings.value("network/discovery_address", "auto")
+        saved_fallback = settings.value("network/discovery_include_fallback", True)
+    except (ValueError, OSError, RuntimeError):
+        return None, True
+    fallback = saved_fallback is not False and str(saved_fallback).lower() not in {
+        "false", "0", "no"}
+    if not isinstance(saved_address, str) or saved_address.strip().lower() == "auto":
+        return None, fallback
+    parts = [part.strip() for part in saved_address.split(",")]
+    addresses: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        try:
+            _ip_address(part)
+        except ValueError:
+            return None, fallback
+        addresses.append(part)
+    if not addresses:
+        return None, fallback
+    return tuple(addresses), fallback
 
 
 def main() -> int:
@@ -32,6 +61,13 @@ def main() -> int:
     parser.add_argument("--secure-port", type=port_number, default=SECURE_PORT)
     parser.add_argument("--broadcast", default="255.255.255.255")
     parser.add_argument("--reuse-address", action="store_true")
+    parser.add_argument("--source-address", action="append", default=None,
+                        help="also announce from one local IPv4 address; repeatable "
+                             "unless --no-fallback is given")
+    parser.add_argument("--no-fallback", action="store_true",
+                        help="do not also announce through the OS default route")
+    parser.add_argument("--discovery-auto", action="store_true",
+                        help="ignore persisted egress selection for this launch")
     parser.add_argument("--identity-file", type=Path, default=root / "lan-manager/peer-id")
     parser.add_argument("--security-identity-file", type=Path,
                         default=root / "lan-manager/identity.pem")
@@ -39,6 +75,8 @@ def main() -> int:
                         default=root / "lan-manager/trust.json")
     parser.add_argument("--post-file", type=Path, default=root / "lan-manager/posts.jsonl")
     args = parser.parse_args()
+    if args.discovery_auto and args.source_address:
+        parser.error("--discovery-auto cannot be combined with --source-address")
     logging.basicConfig(level=logging.INFO)
     try:
         peer_id = load_identity(args.identity_file)
@@ -50,9 +88,21 @@ def main() -> int:
             args.secure_port, identity.fingerprint)
         secure_transport = SecureTransport(
             identity, TrustStore(args.trust_file), hello)
+        if args.discovery_auto:
+            sources: tuple[str, ...] | None = None
+            fallback = not args.no_fallback
+        elif args.source_address is not None:
+            sources = tuple(args.source_address)
+            fallback = not args.no_fallback
+        else:
+            saved_sources, saved_fallback = _saved_discovery_selection()
+            sources = saved_sources
+            fallback = False if args.no_fallback else saved_fallback
         service = ChatService(hello, args.port, args.broadcast, args.reuse_address,
                               JsonLinesPostStore(args.post_file),
-                              secure_transport=secure_transport)
+                              secure_transport=secure_transport,
+                              discovery_source_addresses=sources,
+                              discovery_include_fallback=fallback)
     except (ValueError, OSError) as error:
         logging.error("Startup failed: %s", error)
         return 1

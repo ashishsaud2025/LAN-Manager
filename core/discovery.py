@@ -144,35 +144,54 @@ def local_ipv4_addresses() -> tuple[str, ...]:
         int(part) for part in item.split("."))))
 
 
+MAX_SENDERS = 16
+
+
+def _validate_source_addresses(
+        value: tuple[str, ...] | list[str] | None) -> tuple[str, ...] | None:
+    """Validate explicit egress selection without probing the network."""
+    if value is None:
+        return None
+    if not isinstance(value, (tuple, list)):
+        raise ValueError("source_addresses must be a tuple or None")
+    resolved = tuple(value)
+    for item in resolved:
+        if not isinstance(item, str) or not item or len(item) > 255:
+            raise ValueError("source address must be a bounded string")
+        try:
+            ip_address(item)
+        except ValueError as error:
+            raise ValueError(f"invalid IPv4 source address: {item}") from error
+    return resolved
+
+
 class DiscoveryTransport:
-    """Own a receiving socket and a separate broadcast sending socket."""
+    """Own a receiving socket and bounded broadcast sending sockets."""
 
     def __init__(self, session_id: str, port: int = DISCOVERY_PORT,
                  destination: str = BROADCAST_ADDRESS,
                  reuse_address: bool = False,
-                 source_addresses: tuple[str, ...] | None = None) -> None:
+                 source_addresses: tuple[str, ...] | None = None,
+                 include_fallback: bool = True) -> None:
+        if type(include_fallback) is not bool:
+            raise ValueError("include_fallback must be bool")
+        resolved_sources = _validate_source_addresses(source_addresses)
         self.session_id = session_id
         self.destination = (destination, port)
         self.receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.senders: list[socket.socket] = []
+        self._fallback: socket.socket | None = None
+        self._bound: dict[str, socket.socket] = {}
+        self.source_addresses = resolved_sources
+        self.include_fallback = include_fallback
         try:
             if reuse_address:
                 self.receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.receiver.bind((BIND_ADDRESS, port))
-            self.senders.append(self._sender())
             candidates = (local_ipv4_addresses()
-                          if source_addresses is None else source_addresses)
-            for address in candidates[:16]:
-                sender = self._sender()
-                try:
-                    sender.bind((address, 0))
-                except OSError as error:
-                    sender.close()
-                    logger.warning("Could not bind discovery sender to %s: %s",
-                                   address, error)
-                    continue
-                self.senders.append(sender)
-        except OSError:
+                          if resolved_sources is None else resolved_sources)
+            self.refresh_senders(candidates, include_fallback)
+        except (OSError, ValueError):
             self.close()
             raise
 
@@ -213,9 +232,77 @@ class DiscoveryTransport:
             return None
         return hello, address
 
+    def refresh_senders(self, addresses: tuple[str, ...],
+                          include_fallback: bool) -> bool:
+        """Reconcile egress sockets without touching the receiver."""
+        if type(include_fallback) is not bool:
+            raise ValueError("include_fallback must be bool")
+        desired = tuple(dict.fromkeys(tuple(addresses)))[:MAX_SENDERS]
+        wanted = set(desired)
+        changed = include_fallback != (self._fallback is not None)
+        for address in tuple(self._bound):
+            if address not in wanted:
+                sock = self._bound.pop(address)
+                try:
+                    sock.close()
+                except OSError:
+                    logger.debug("Could not close removed sender", exc_info=True)
+                changed = True
+        if include_fallback and self._fallback is None:
+            self._fallback = self._sender()
+            changed = True
+        if not include_fallback and self._fallback is not None:
+            try:
+                self._fallback.close()
+            except OSError:
+                logger.debug("Could not close fallback sender", exc_info=True)
+            self._fallback = None
+            changed = True
+        for address in desired:
+            if address in self._bound:
+                continue
+            sender = self._sender()
+            try:
+                sender.bind((address, 0))
+            except OSError as error:
+                sender.close()
+                logger.warning("Could not bind discovery sender to %s: %s",
+                               address, error)
+                continue
+            self._bound[address] = sender
+            changed = True
+        ordered: list[socket.socket] = []
+        if self._fallback is not None:
+            ordered.append(self._fallback)
+        for address in desired:
+            sock = self._bound.get(address)
+            if sock is not None:
+                ordered.append(sock)
+        self.senders = ordered
+        self.include_fallback = include_fallback
+        return changed
+
+    def bound_addresses(self) -> tuple[str, ...]:
+        """Return currently bound egress addresses in announcement order."""
+        return tuple(address for address, sock in self._bound.items()
+                     if sock in self.senders)
+
     def close(self) -> None:
         """Release all sockets, including after partial initialization."""
-        self.receiver.close()
-        for sender in self.senders:
-            sender.close()
+        try:
+            self.receiver.close()
+        except OSError:
+            logger.debug("Could not close receiver", exc_info=True)
+        if self._fallback is not None:
+            try:
+                self._fallback.close()
+            except OSError:
+                logger.debug("Could not close fallback sender", exc_info=True)
+            self._fallback = None
+        for sender in tuple(self._bound.values()):
+            try:
+                sender.close()
+            except OSError:
+                logger.debug("Could not close bound sender", exc_info=True)
+        self._bound.clear()
         self.senders.clear()
