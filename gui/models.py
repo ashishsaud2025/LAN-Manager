@@ -119,7 +119,7 @@ class PeerListModel(QAbstractListModel):
             state = "Nearby" if peer.nearby else "Offline / stale"
             trust = peer_trust_label(peer)
             return (f"{peer.hello.name} · {state} · seen {age:.1f}s ago\n"
-                    f"{peer.ip}:{peer.hello.tcp_port}  ·  {capabilities}\n"
+                    f"{endpoint_label(peer)}  ·  {capabilities}\n"
                     f"{trust} · session {peer.hello.session_id[:8]}…")
         if role == self.PeerRole:
             return peer
@@ -128,7 +128,9 @@ class PeerListModel(QAbstractListModel):
                     f"Trust evidence: {peer_trust_label(peer)}. Discovery itself "
                     "is not authenticated.")
         if role == Qt.ItemDataRole.AccessibleTextRole:
-            return (f"{peer.hello.name}, endpoint {peer.ip}:{peer.hello.tcp_port}, "
+            candidates = (", ".join(item.ip for item in peer.endpoint_candidates)
+                          if peer.endpoint_candidates else peer.ip)
+            return (f"{peer.hello.name}, endpoints {candidates}:{peer.hello.tcp_port}, "
                     f"{'nearby' if peer.nearby else 'offline or stale'}, "
                     f"{peer_trust_label(peer)}")
         return None
@@ -187,7 +189,7 @@ class PeerTableModel(QAbstractTableModel):
                 (f"{peer.hello.name}\n"
                  f"{'Nearby' if peer.nearby else 'Offline / stale'} · "
                  f"{peer_trust_label(peer)} · {peer.hello.session_id[:8]}…"),
-                f"{peer.ip}:{peer.hello.tcp_port}",
+                endpoint_label(peer),
                 f"{age:.1f} s ago\n{'Nearby' if peer.nearby else 'Stale'}",
                 "  ·  ".join(capability_label(item)
                               for item in peer.hello.capabilities) or "Presence only",
@@ -195,10 +197,12 @@ class PeerTableModel(QAbstractTableModel):
             return values[index.column()]
         if role == Qt.ItemDataRole.AccessibleTextRole:
             age = max(0.0, time.monotonic() - peer.last_seen)
+            candidates = (", ".join(item.ip for item in peer.endpoint_candidates)
+                          if peer.endpoint_candidates else peer.ip)
             values = (
                 f"Session {peer.hello.name}, {peer_trust_label(peer)}, identifier "
                 f"{peer.hello.session_id}",
-                f"Observed endpoint {peer.ip}:{peer.hello.tcp_port}",
+                f"Observed endpoints {candidates}:{peer.hello.tcp_port}",
                 f"Last HELLO {age:.1f} seconds ago, "
                 f"{'nearby' if peer.nearby else 'offline or stale'}",
                 "Capabilities " + (", ".join(
@@ -532,3 +536,12 @@ def peer_trust_label(peer: PeerRecord) -> str:
         TrustState.PAIRED: "Paired key",
         TrustState.KEY_CHANGED: "Key changed",
     }[peer.trust_state]
+
+
+def endpoint_label(peer: PeerRecord) -> str:
+    """Present preferred endpoint with honest alternative count."""
+    base = f"{peer.ip}:{peer.hello.tcp_port}"
+    total = len(peer.endpoint_candidates) if peer.endpoint_candidates else 1
+    if total > 1:
+        return f"{base} +{total - 1}"
+    return base

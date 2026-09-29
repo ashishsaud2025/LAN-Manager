@@ -12,11 +12,11 @@ from PySide6.QtCore import QModelIndex, QSettings, Qt, QTimer, QUrl, Slot
 from PySide6.QtGui import (QCloseEvent, QDesktopServices, QKeySequence,
                            QResizeEvent, QShortcut, QTextCursor)
 from PySide6.QtWidgets import (
-    QAbstractButton, QApplication, QComboBox, QDoubleSpinBox, QFileDialog,
-    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QListView, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-    QSpinBox, QSplitter, QStackedWidget, QTableView, QTabWidget, QTextEdit,
-    QVBoxLayout, QWidget,
+    QAbstractButton, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+    QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QListView, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QScrollArea, QSpinBox, QSplitter, QStackedWidget, QTableView, QTabWidget,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 from core.chat import ChatService
@@ -51,7 +51,8 @@ from gui.models import (
     ActivityEntry, ActivityListModel, AdminDevice, AdminDeviceListModel,
     DirectoryListModel, MessageEntry, MessageListModel, PeerListModel,
     PeerTableModel, PostListModel, TerminalTransferProxy, TransferListModel,
-    capability_label, format_eta, human_bytes, peer_trust_label, transfer_pace,
+    capability_label, endpoint_label, format_eta, human_bytes,
+    peer_trust_label, transfer_pace,
 )
 from gui.peer_selection import PeerSelection
 from gui.theme import GEOMETRY, SPACING, apply_theme
@@ -1196,6 +1197,42 @@ class MainWindow(QMainWindow):
         form.addWidget(appearance_label, appearance_row, 0)
         form.addWidget(self.theme_selector, appearance_row, 1)
         layout.addWidget(identity)
+        network = QFrame()
+        network.setProperty("card", True)
+        network_layout = QVBoxLayout(network)
+        network_heading = QLabel("Discovery Network")
+        network_heading.setObjectName("PanelTitle")
+        network_layout.addWidget(network_heading)
+        network_detail = QLabel(
+            "Choose which local address carries UDP announcements. "
+            "Inbound discovery and TCP listeners remain on all interfaces.")
+        network_detail.setObjectName("PageSubtitle")
+        network_detail.setWordWrap(True)
+        network_layout.addWidget(network_detail)
+        network_form = QGridLayout()
+        network_form.addWidget(QLabel("Announcement address"), 0, 0)
+        self.discovery_address = QComboBox()
+        self.discovery_address.setAccessibleName("Discovery announcement address")
+        network_form.addWidget(self.discovery_address, 0, 1)
+        self.discovery_fallback = QCheckBox("Also announce through OS default route")
+        self.discovery_fallback.setAccessibleName("Discovery fallback route")
+        network_form.addWidget(self.discovery_fallback, 1, 1)
+        network_layout.addLayout(network_form)
+        self.discovery_status = QLabel("Discovery egress not configured")
+        self.discovery_status.setObjectName("PageSubtitle")
+        self.discovery_status.setWordWrap(True)
+        network_layout.addWidget(self.discovery_status)
+        network_actions = QHBoxLayout()
+        self.discovery_refresh = action_button(
+            "Refresh", self._refresh_discovery_addresses)
+        self.discovery_apply = action_button(
+            "Apply", self._apply_discovery_selection, True)
+        network_actions.addWidget(self.discovery_refresh)
+        network_actions.addWidget(self.discovery_apply)
+        network_actions.addStretch(1)
+        network_layout.addLayout(network_actions)
+        layout.addWidget(network)
+        self._refresh_discovery_addresses()
         portal = QFrame()
         portal.setProperty("card", True)
         portal_layout = QVBoxLayout(portal)
@@ -1408,6 +1445,88 @@ class MainWindow(QMainWindow):
         self.overview_topology.set_theme(self.theme_mode)
         self.topology.select_session(self.peer_selection.session_id)
         self.overview_topology.select_session(self.peer_selection.session_id)
+
+    @Slot()
+    def _refresh_discovery_addresses(self) -> None:
+        """Re-enumerate local addresses without changing egress selection."""
+        try:
+            current_sources, current_fallback, _ = self.service.discovery_selection()
+        except (AttributeError, ValueError):
+            current_sources, current_fallback = None, True
+        addresses = local_ipv4_addresses()
+        self.discovery_address.blockSignals(True)
+        self.discovery_address.clear()
+        self.discovery_address.addItem("Automatic: all detected addresses", None)
+        for address in addresses:
+            self.discovery_address.addItem(address, address)
+        if current_sources is None:
+            self.discovery_address.setCurrentIndex(0)
+        elif len(current_sources) == 1 and current_sources[0] in addresses:
+            self.discovery_address.setCurrentIndex(
+                self.discovery_address.findData(current_sources[0]))
+        elif len(current_sources) == 1:
+            self.discovery_address.addItem(
+                f"{current_sources[0]} (unavailable)", current_sources[0])
+            self.discovery_address.setCurrentIndex(
+                self.discovery_address.count() - 1)
+        else:
+            self.discovery_address.addItem(
+                f"Custom selection ({len(current_sources)} addresses)",
+                tuple(current_sources))
+            self.discovery_address.setCurrentIndex(
+                self.discovery_address.count() - 1)
+        self.discovery_address.blockSignals(False)
+        self.discovery_fallback.setChecked(bool(current_fallback))
+        self._render_discovery_status(current_sources, bool(current_fallback))
+
+    def _render_discovery_status(
+            self, sources: tuple[str, ...] | None, fallback: bool) -> None:
+        """Describe announcement scope without claiming route selection."""
+        if sources is None:
+            selected = "Automatic: all detected addresses"
+        elif len(sources) == 1:
+            selected = sources[0]
+        elif not sources:
+            selected = "No bound address"
+        else:
+            selected = f"Custom selection ({len(sources)} addresses)"
+        route = "with OS default route" if fallback else "without OS default route"
+        self.discovery_status.setText(
+            f"Announces from {selected} {route}. Applies live. "
+            "Inbound discovery and TCP listeners remain on all interfaces.")
+
+    @Slot()
+    def _apply_discovery_selection(self) -> None:
+        """Apply announcement egress live and persist the selection."""
+        data = self.discovery_address.currentData()
+        if data is None:
+            sources: tuple[str, ...] | None = None
+        elif isinstance(data, str):
+            sources = (data,)
+        elif isinstance(data, tuple):
+            sources = tuple(data)
+        else:
+            sources = None
+        fallback = self.discovery_fallback.isChecked()
+        try:
+            self.service.set_discovery_source_addresses(sources, fallback)
+        except ValueError as error:
+            self.append(f"Discovery selection rejected: {error}",
+                        "Network", "warning")
+            return
+        try:
+            if sources is None:
+                self.settings.setValue("network/discovery_address", "auto")
+            else:
+                self.settings.setValue("network/discovery_address",
+                                       ",".join(sources) if sources else "auto")
+            self.settings.setValue("network/discovery_include_fallback", fallback)
+        except (OSError, RuntimeError, ValueError) as error:
+            self.append(f"Could not persist discovery selection: {error}",
+                        "Network", "warning")
+        self._render_discovery_status(sources, fallback)
+        self.append("Discovery announcement selection applied live.",
+                    "Network")
 
     @Slot()
     def _start_portal(self) -> None:
@@ -1727,7 +1846,7 @@ class MainWindow(QMainWindow):
                         or device.address != address
                         or device.port != self.admin_port.value()
                         or record is None or not record.nearby
-                        or record.ip != address
+                        or address not in record.candidate_ips()
                         or record.hello.tcp_port != self.admin_port.value()
                         or record.hello.peer_id != device.peer_id
                         or record.session_id != device.session_id
@@ -1797,14 +1916,25 @@ class MainWindow(QMainWindow):
         selected = self.admin_device_model.device_at(
             self.admin_device_list.currentIndex().row())
         selected_key = selected.key if selected is not None else None
-        devices = [AdminDevice(
-            key=f"peer:{record.session_id}", label=record.hello.name,
-            address=record.ip, source="LAN Atlas HELLO",
-            detail=(f"Recent session; {peer_trust_label(record)}; discovery not authenticated · "
-                     f"{', '.join(record.hello.capabilities) or 'presence only'}"),
-            port=record.hello.tcp_port, capabilities=record.hello.capabilities,
-            peer_id=record.hello.peer_id, session_id=record.session_id)
-            for record in self.peer_records if record.nearby]
+        devices: list[AdminDevice] = []
+        for record in self.peer_records:
+            if not record.nearby:
+                continue
+            candidates = ([item.ip for item in record.endpoint_candidates]
+                          if record.endpoint_candidates else [record.ip])
+            for address in candidates:
+                marker = "" if address == record.ip else " · alternate"
+                devices.append(AdminDevice(
+                    key=f"peer:{record.session_id}:{address}",
+                    label=f"{record.hello.name} · {address}",
+                    address=address, source="LAN Atlas HELLO",
+                    detail=(f"Recent session; {peer_trust_label(record)}; "
+                            "discovery not authenticated · "
+                            f"{', '.join(record.hello.capabilities) or 'presence only'}"
+                            f"{marker}"),
+                    port=record.hello.tcp_port,
+                    capabilities=record.hello.capabilities,
+                    peer_id=record.hello.peer_id, session_id=record.session_id))
         devices.extend(AdminDevice(
             f"neighbor:{neighbor.interface or ''}:{neighbor.address}",
             f"Neighbor {neighbor.address}", neighbor.address, "OS neighbor cache",
@@ -2168,10 +2298,9 @@ class MainWindow(QMainWindow):
             return
         labels = [capability_label(item) for item in record.hello.capabilities]
         self.overview_peer_name.setText(record.hello.name)
-        self.overview_peer_endpoint.setText(
-            f"{record.ip}:{record.hello.tcp_port}")
+        self.overview_peer_endpoint.setText(endpoint_label(record))
         self.overview_peer_endpoint.setToolTip(
-            f"{record.ip}:{record.hello.tcp_port}")
+            ", ".join(record.candidate_ips()))
         self.overview_peer_installation.setText(f"{record.hello.peer_id[:12]}…")
         self.overview_peer_installation.setToolTip(record.hello.peer_id)
         self.overview_peer_session.setText(f"{record.session_id[:12]}…")
@@ -2189,10 +2318,9 @@ class MainWindow(QMainWindow):
             self.overview_peer_rtt.setText(
                 f"Measured latency: {record.latency_ms:.1f} ms{source}")
         self.network_selected_name.setText(record.hello.name)
-        self.network_selected_endpoint.setText(
-            f"{record.ip}:{record.hello.tcp_port}")
+        self.network_selected_endpoint.setText(endpoint_label(record))
         self.network_selected_endpoint.setToolTip(
-            f"{record.ip}:{record.hello.tcp_port}")
+            ", ".join(record.candidate_ips()))
         self.network_selected_session.setText(f"{record.session_id[:12]}…")
         self.network_selected_session.setToolTip(record.session_id)
         self.network_selected_state.setText(
@@ -2246,7 +2374,7 @@ class MainWindow(QMainWindow):
         self.peer_name.setText(record.hello.name)
         self.peer_presence.setText(f"{state} · last announcement {age:.1f} seconds ago")
         self.peer_endpoint.setText(
-            f"Observed endpoint: {record.ip}:{record.hello.tcp_port}")
+            f"Observed endpoint: {endpoint_label(record)}")
         self.peer_installation.setText(f"{record.hello.peer_id[:12]}…")
         self.peer_installation.setToolTip(record.hello.peer_id)
         self.peer_session.setText(f"{record.session_id[:12]}…")
@@ -2481,9 +2609,12 @@ class MainWindow(QMainWindow):
         evidence_filter = self._device_tab_key
         for row, peer in enumerate(self.peer_table_model.records):
             labels = tuple(capability_label(item) for item in peer.hello.capabilities)
+            candidates = ([item.ip for item in peer.endpoint_candidates]
+                          if peer.endpoint_candidates else [peer.ip])
             values = " ".join((peer.hello.name, peer.ip, str(peer.hello.tcp_port),
                                f"{peer.ip}:{peer.hello.tcp_port}", peer.session_id,
                                peer.hello.peer_id, peer.mac_address or "",
+                               *candidates,
                                *peer.hello.capabilities, *labels)).casefold()
             matches_state = (
                 evidence_filter == "all"
@@ -2575,9 +2706,13 @@ class MainWindow(QMainWindow):
             f"{peer.hello.name} · LAN Atlas HELLO\n"
             f"Endpoint is observed and advertised · {peer_trust_label(record)}. "
             "The discovery observation itself is not authenticated.")
-        key = f"peer:{peer.hello.session_id}"
+        key = f"peer:{peer.hello.session_id}:{peer.ip}"
         row = next((index for index, device in enumerate(self.admin_device_model.devices)
                     if device.key == key), -1)
+        if row < 0:
+            row = next((index for index, device in enumerate(
+                self.admin_device_model.devices)
+                if device.session_id == peer.hello.session_id), -1)
         if row >= 0:
             self.admin_device_list.setCurrentIndex(
                 self.admin_device_model.index(row, 0))
