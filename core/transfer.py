@@ -24,7 +24,7 @@ from core.protocol import (
     MAX_FILE_SIZE, ProtocolError, envelope, recv_message, send_message,
     validate_envelope,
 )
-from core.roster import Peer
+from core.roster import Peer, candidate_ips
 from core.secure_transport import SecureTransportError
 
 CHUNK_SIZE = 64 * 1024
@@ -413,5 +413,13 @@ class TransferService:
 
     @staticmethod
     def _connect_plaintext(peer: Peer) -> tuple[socket.socket, bool]:
-        return (socket.create_connection(
-            (peer.ip, peer.hello.tcp_port), timeout=3), False)
+        error: OSError | None = None
+        for address in candidate_ips(peer):
+            try:
+                return (socket.create_connection(
+                    (address, peer.hello.tcp_port), timeout=3), False)
+            except OSError as exc:
+                error = exc
+                continue
+        assert error is not None
+        raise error

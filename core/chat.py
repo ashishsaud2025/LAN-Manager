@@ -12,7 +12,7 @@ import time
 from typing import Any
 from uuid import uuid4
 
-from core.discovery import DiscoveryTransport, Hello, encode_hello
+from core.discovery import DiscoveryTransport, Hello, encode_hello, local_ipv4_addresses
 from core.diagnostics import DiagnosticsService
 from core.feed import merge_page, serve_query
 from core.message_journal import MessageJournal
@@ -23,7 +23,7 @@ from core.post_signatures import sign_post
 from core.protocol import (
     ProtocolError, envelope, recv_message, send_message, validate_envelope,
 )
-from core.roster import Peer, PeerRoster
+from core.roster import Peer, PeerRoster, candidate_ips
 from core.secure_transport import (
     PairingCandidate, SecureTransport, SecureTransportError,
 )
@@ -41,14 +41,24 @@ class ChatService:
                  reuse_address: bool = False,
                  post_store: PostStore | None = None,
                  message_journal: MessageJournal | None = None,
-                 secure_transport: SecureTransport | None = None) -> None:
+                 secure_transport: SecureTransport | None = None,
+                 discovery_source_addresses: tuple[str, ...] | None = None,
+                 discovery_include_fallback: bool = True) -> None:
         self.hello = hello
         encode_hello(hello)
         if (secure_transport is not None
                 and secure_transport.local_hello != hello):
             raise ValueError("secure transport does not correspond to HELLO")
+        if type(discovery_include_fallback) is not bool:
+            raise ValueError("discovery_include_fallback must be bool")
+        resolved_sources = _validate_discovery_sources(discovery_source_addresses)
         self.discovery_options = (hello.session_id, discovery_port,
-                                  broadcast, reuse_address)
+                                  broadcast, reuse_address, resolved_sources,
+                                  discovery_include_fallback)
+        self._discovery_config_lock = threading.Lock()
+        self._discovery_sources = resolved_sources
+        self._discovery_fallback = discovery_include_fallback
+        self._discovery_revision = 0
         self.events: Queue[tuple[str, Any]] = Queue(maxsize=512)
         self._incoming: Queue[socket.socket] = Queue(maxsize=16)
         self._secure_incoming: Queue[socket.socket] = Queue(maxsize=16)
@@ -251,14 +261,62 @@ class ChatService:
         return (transfers_done and diagnostics_done
                 and not any(thread.is_alive() for thread in self._threads))
 
+    def set_discovery_source_addresses(
+            self, addresses: tuple[str, ...] | None,
+            include_fallback: bool | None = None) -> None:
+        """Select announcement egress without touching sockets from the caller."""
+        resolved = _validate_discovery_sources(addresses)
+        with self._discovery_config_lock:
+            if include_fallback is None:
+                fallback = self._discovery_fallback
+            elif type(include_fallback) is not bool:
+                raise ValueError("include_fallback must be bool")
+            else:
+                fallback = include_fallback
+            if resolved == self._discovery_sources and fallback == self._discovery_fallback:
+                return
+            self._discovery_sources = resolved
+            self._discovery_fallback = fallback
+            self._discovery_revision += 1
+
+    def discovery_selection(self) -> tuple[tuple[str, ...] | None, bool, int]:
+        """Return selected sources, fallback mode, and config revision."""
+        with self._discovery_config_lock:
+            return (self._discovery_sources, self._discovery_fallback,
+                    self._discovery_revision)
+
     def _presence(self) -> None:
         transport = None
         roster = PeerRoster(self.hello.session_id)
         try:
             transport = DiscoveryTransport(*self.discovery_options)
             due = time.monotonic()
+            applied_revision = 0
+            last_auto_check = 0.0
+            last_auto_snapshot: tuple[str, ...] | None = None
             while not self._stop.is_set():
                 now = time.monotonic()
+                sources, fallback, revision = self.discovery_selection()
+                if sources is None and now - last_auto_check >= 5.0:
+                    last_auto_check = now
+                    snapshot = local_ipv4_addresses()
+                    if snapshot != last_auto_snapshot:
+                        last_auto_snapshot = snapshot
+                        try:
+                            transport.refresh_senders(snapshot, fallback)
+                        except (OSError, ValueError) as error:
+                            self._event("status", f"Discovery refresh failed: {error}")
+                if revision != applied_revision:
+                    applied_revision = revision
+                    resolved = (local_ipv4_addresses()
+                                if sources is None else sources)
+                    if sources is None:
+                        last_auto_snapshot = resolved
+                        last_auto_check = now
+                    try:
+                        transport.refresh_senders(resolved, fallback)
+                    except (OSError, ValueError) as error:
+                        self._event("status", f"Discovery refresh failed: {error}")
                 roster.expire(now)
                 if now >= due:
                     try:
@@ -484,13 +542,32 @@ class ChatService:
                 logging.debug("Close raced stopped service: %s", error)
 
     def _connect_peer(self, peer: Peer) -> tuple[socket.socket, bool]:
+        addresses = candidate_ips(peer)
         if (self.secure_transport is not None
                 and self.secure_transport.trust_store.get(peer.hello.peer_id)
                 is not None):
-            channel = self.secure_transport.connect(peer)
-            return channel.socket, True
-        return (socket.create_connection(
-            (peer.ip, peer.hello.tcp_port), timeout=3), False)
+            error: Exception | None = None
+            for address in addresses:
+                attempt = Peer(peer.hello, address, peer.last_seen,
+                               peer.endpoint_candidates)
+                try:
+                    channel = self.secure_transport.connect(attempt)
+                    return channel.socket, True
+                except (OSError, SecureTransportError, ValueError) as exc:
+                    error = exc
+                    continue
+            assert error is not None
+            raise error
+        connect_error: OSError | None = None
+        for address in addresses:
+            try:
+                return (socket.create_connection(
+                    (address, peer.hello.tcp_port), timeout=3), False)
+            except OSError as exc:
+                connect_error = exc
+                continue
+        assert connect_error is not None
+        raise connect_error
 
     def _resolve_trust(self, hello: Hello) -> TrustState:
         transport = self.secure_transport
@@ -607,3 +684,22 @@ class ChatService:
                                 "author_id": None})
         self._event("feed_updated", {"added": added, "duplicates": duplicates,
                                      "partial": True})
+
+
+def _validate_discovery_sources(
+        value: tuple[str, ...] | list[str] | None) -> tuple[str, ...] | None:
+    """Validate announcement egress selection without probing the network."""
+    if value is None:
+        return None
+    if not isinstance(value, (tuple, list)):
+        raise ValueError("discovery sources must be a tuple or None")
+    from ipaddress import ip_address as _ip_address
+    resolved = tuple(value)
+    for item in resolved:
+        if not isinstance(item, str) or not item or len(item) > 255:
+            raise ValueError("discovery source must be a bounded string")
+        try:
+            _ip_address(item)
+        except ValueError as error:
+            raise ValueError(f"invalid IPv4 discovery source: {item}") from error
+    return resolved

@@ -10,7 +10,7 @@ import threading
 
 from core.diagnostics import NeighborSnapshot, ProbeResult
 from core.discovery import Hello
-from core.roster import Peer
+from core.roster import EndpointCandidate, Peer
 
 STALE_RETENTION = 300.0
 MAX_RETAINED_PEERS = 512
@@ -68,6 +68,7 @@ class PeerRecord:
     latency_ms: float | None = None
     latency_source: str | None = None
     services: tuple[str, ...] = ()
+    endpoint_candidates: tuple[EndpointCandidate, ...] = ()
 
     @property
     def session_id(self) -> str:
@@ -81,7 +82,17 @@ class PeerRecord:
 
     def as_peer(self) -> Peer:
         """Return the active transport shape used by existing services."""
-        return Peer(self.hello, self.ip, self.last_seen)
+        return Peer(self.hello, self.ip, self.last_seen, self.endpoint_candidates)
+
+    def candidate_ips(self) -> tuple[str, ...]:
+        """Return observed addresses with preferred endpoint first."""
+        if not self.endpoint_candidates:
+            return (self.ip,)
+        ordered = [item.ip for item in self.endpoint_candidates]
+        if self.ip not in ordered:
+            return (self.ip, *ordered)
+        ordered.remove(self.ip)
+        return (self.ip, *ordered)
 
 
 @dataclass(frozen=True)
@@ -173,6 +184,7 @@ class PeerRepository:
                     latency_ms=previous.latency_ms if same_endpoint else None,
                     latency_source=previous.latency_source if same_endpoint else None,
                     services=previous.services if same_endpoint else (),
+                    endpoint_candidates=_peer_candidates(peer),
                 )
             for session_id, record in tuple(self._records.items()):
                 if session_id not in active_ids and record.nearby:
@@ -230,7 +242,7 @@ class PeerRepository:
             if pending is None:
                 return None
             record = self._records.get(pending.session_id)
-            if (record is None or record.ip != pending.address
+            if (record is None or not _has_candidate(record, pending.address)
                     or result.address != pending.address
                     or result.kind != pending.kind
                     or pending.port is not None
@@ -242,17 +254,19 @@ class PeerRepository:
             compatible = record.compatibility_state
             latency_ms = record.latency_ms
             latency_source = record.latency_source
+            suffix = ("" if result.address == record.ip
+                      else f" ({result.address})")
             if result.kind == "ping" and result.state == "reachable":
                 reachable = ReachabilityState.REACHABLE
                 if _valid_latency(result.rtt_ms):
                     latency_ms = result.rtt_ms
-                    latency_source = "ping"
+                    latency_source = f"ping{suffix}"
             elif result.kind == "tcp":
                 if result.state in {"reachable", "refused"}:
                     reachable = ReachabilityState.REACHABLE
                     if _valid_latency(result.rtt_ms):
                         latency_ms = result.rtt_ms
-                        latency_source = "tcp"
+                        latency_source = f"tcp{suffix}"
                 elif result.state in {"timed_out", "network_unreachable"}:
                     reachable = ReachabilityState.UNREACHABLE
             elif result.kind == "echo":
@@ -261,18 +275,18 @@ class PeerRepository:
                     compatible = CompatibilityState.COMPATIBLE
                     if _valid_latency(result.rtt_ms):
                         latency_ms = result.rtt_ms
-                        latency_source = "echo"
+                        latency_source = f"echo{suffix}"
                 elif result.state == "incompatible":
                     reachable = ReachabilityState.REACHABLE
                     compatible = CompatibilityState.INCOMPATIBLE
                     if _valid_latency(result.rtt_ms):
                         latency_ms = result.rtt_ms
-                        latency_source = "echo"
+                        latency_source = f"echo{suffix}"
                 elif result.state == "refused":
                     reachable = ReachabilityState.REACHABLE
                     if _valid_latency(result.rtt_ms):
                         latency_ms = result.rtt_ms
-                        latency_source = "tcp"
+                        latency_source = f"tcp{suffix}"
                 elif result.state in {"timed_out", "network_unreachable"}:
                     reachable = ReachabilityState.UNREACHABLE
             self._records[pending.session_id] = replace(
@@ -358,6 +372,22 @@ class PeerRepository:
 
 def _unverified_trust(_hello: Hello) -> TrustState:
     return TrustState.UNVERIFIED
+
+
+def _peer_candidates(peer: Peer) -> tuple[EndpointCandidate, ...]:
+    """Return bounded candidates with legacy single endpoint fallback."""
+    if peer.endpoint_candidates:
+        return peer.endpoint_candidates
+    return (EndpointCandidate(peer.ip, peer.last_seen),)
+
+
+def _has_candidate(record: PeerRecord, address: str) -> bool:
+    """Return whether an address remains a live observed candidate."""
+    if not record.nearby:
+        return False
+    if record.endpoint_candidates:
+        return any(item.ip == address for item in record.endpoint_candidates)
+    return record.ip == address
 
 
 def _valid_latency(value: float | int | None) -> bool:
