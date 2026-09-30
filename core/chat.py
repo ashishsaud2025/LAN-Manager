@@ -12,7 +12,10 @@ import time
 from typing import Any
 from uuid import uuid4
 
-from core.discovery import DiscoveryTransport, Hello, encode_hello, local_ipv4_addresses
+from core.discovery import (
+    DiscoveryTransport, Hello, encode_hello, local_ipv4_addresses,
+    local_ipv6_addresses,
+)
 from core.diagnostics import DiagnosticsService
 from core.feed import merge_page, serve_query
 from core.message_journal import MessageJournal
@@ -299,7 +302,8 @@ class ChatService:
                 sources, fallback, revision = self.discovery_selection()
                 if sources is None and now - last_auto_check >= 5.0:
                     last_auto_check = now
-                    snapshot = local_ipv4_addresses()
+                    snapshot = (local_ipv4_addresses()
+                                + local_ipv6_addresses())
                     if snapshot != last_auto_snapshot:
                         last_auto_snapshot = snapshot
                         try:
@@ -308,7 +312,7 @@ class ChatService:
                             self._event("status", f"Discovery refresh failed: {error}")
                 if revision != applied_revision:
                     applied_revision = revision
-                    resolved = (local_ipv4_addresses()
+                    resolved = (local_ipv4_addresses() + local_ipv6_addresses()
                                 if sources is None else sources)
                     if sources is None:
                         last_auto_snapshot = resolved
@@ -324,9 +328,12 @@ class ChatService:
                     except OSError as error:
                         self._event("status", f"Discovery send failed: {error}")
                     due = now + 2
-                ready, _, _ = select.select([transport.receiver], [], [], 0.2)
-                if ready:
-                    result = transport.receive()
+                ready, _, _ = select.select(transport.receivers, [], [], 0.2)
+                for sock in ready:
+                    if sock is transport.receiver:
+                        result = transport.receive()
+                    else:
+                        result = transport.receive_v6()
                     if result is not None:
                         hello, address = result
                         roster.update(hello, address[0], time.monotonic())
@@ -699,7 +706,7 @@ def _validate_discovery_sources(
         if not isinstance(item, str) or not item or len(item) > 255:
             raise ValueError("discovery source must be a bounded string")
         try:
-            _ip_address(item)
+            _ip_address(item.partition("%")[0])
         except ValueError as error:
-            raise ValueError(f"invalid IPv4 discovery source: {item}") from error
+            raise ValueError(f"invalid IP discovery source: {item}") from error
     return resolved

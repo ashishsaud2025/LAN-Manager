@@ -12,8 +12,9 @@ import time
 from uuid import UUID, uuid4
 
 from core.discovery import (
-    ANNOUNCEMENT_INTERVAL, BROADCAST_ADDRESS, DISCOVERY_PORT, TCP_PORT,
-    DiscoveryTransport, Hello, encode_hello,
+    ANNOUNCEMENT_INTERVAL, BROADCAST_ADDRESS, DISCOVERY_PORT,
+    IPV6_CAPABILITY, TCP_PORT, DiscoveryTransport, Hello, encode_hello,
+    ipv6_supported,
 )
 
 
@@ -49,9 +50,12 @@ def run(hello: Hello, transport: DiscoveryTransport) -> None:
                 logging.warning("Announcement failed: %s", error)
             next_announcement = now + ANNOUNCEMENT_INTERVAL
         timeout = min(0.25, max(0.0, next_announcement - time.monotonic()))
-        readable, _, _ = select.select([transport.receiver], [], [], timeout)
-        if readable:
-            result = transport.receive()
+        readable, _, _ = select.select(transport.receivers, [], [], timeout)
+        for sock in readable:
+            if sock is transport.receiver:
+                result = transport.receive()
+            else:
+                result = transport.receive_v6()
             if result is not None:
                 peer, address = result
                 print(f"HELLO {peer.name!r} peer={peer.peer_id} "
@@ -74,16 +78,17 @@ def main(runner: Callable[[Hello, DiscoveryTransport], None] = run) -> int:
     parser.add_argument("--reuse-address", action="store_true",
                         help="opt in to OS-dependent same-host UDP sharing")
     parser.add_argument("--source-address", action="append", default=None,
-                        help="also announce from one local IPv4 address; repeatable "
-                             "unless --no-fallback is given")
+                        help="also announce from one local IP address, with %scope "
+                             "for IPv6 link local; repeatable unless --no-fallback")
     parser.add_argument("--no-fallback", action="store_true",
                         help="do not also announce through the OS default route")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     transport = None
     try:
+        capabilities = (IPV6_CAPABILITY,) if ipv6_supported() else ()
         hello = Hello(load_identity(args.identity_file), str(uuid4()),
-                      args.name, args.tcp_port)
+                      args.name, args.tcp_port, capabilities)
         encode_hello(hello)
         sources = tuple(args.source_address) if args.source_address else None
         transport = DiscoveryTransport(hello.session_id, args.port,

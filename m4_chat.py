@@ -13,7 +13,7 @@ from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from core.chat import ChatService
-from core.discovery import Hello
+from core.discovery import IPV6_CAPABILITY, Hello, ipv6_supported
 from core.identity import DeviceIdentity
 from core.secure_transport import SECURE_PORT, SecureTransport
 from core.storage import JsonLinesPostStore
@@ -41,7 +41,7 @@ def _saved_discovery_selection() -> tuple[tuple[str, ...] | None, bool]:
         if not part:
             continue
         try:
-            _ip_address(part)
+            _ip_address(part.partition("%")[0])
         except ValueError:
             return None, fallback
         addresses.append(part)
@@ -62,8 +62,8 @@ def main() -> int:
     parser.add_argument("--broadcast", default="255.255.255.255")
     parser.add_argument("--reuse-address", action="store_true")
     parser.add_argument("--source-address", action="append", default=None,
-                        help="also announce from one local IPv4 address; repeatable "
-                             "unless --no-fallback is given")
+                        help="also announce from one local IP address, with %scope "
+                             "for IPv6 link local; repeatable unless --no-fallback")
     parser.add_argument("--no-fallback", action="store_true",
                         help="do not also announce through the OS default route")
     parser.add_argument("--discovery-auto", action="store_true",
@@ -82,10 +82,13 @@ def main() -> int:
         peer_id = load_identity(args.identity_file)
         identity = DeviceIdentity.load_or_create(
             args.security_identity_file, peer_id)
+        capabilities = ["chat_v1", "file_v1", "posts_v1",
+                          "secure_transport_v1"]
+        if ipv6_supported():
+            capabilities.append(IPV6_CAPABILITY)
         hello = Hello(
             peer_id, str(uuid4()), args.name, args.tcp_port,
-            ("chat_v1", "file_v1", "posts_v1", "secure_transport_v1"),
-            args.secure_port, identity.fingerprint)
+            tuple(capabilities), args.secure_port, identity.fingerprint)
         secure_transport = SecureTransport(
             identity, TrustStore(args.trust_file), hello)
         if args.discovery_auto:

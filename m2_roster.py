@@ -38,10 +38,13 @@ def run(hello: Hello, transport: DiscoveryTransport) -> None:
         if changed:
             print_roster(roster)
         timeout = min(0.25, max(0.0, next_announcement - time.monotonic()))
-        readable, _, _ = select.select([transport.receiver], [], [], timeout)
-        if readable:
+        readable, _, _ = select.select(transport.receivers, [], [], timeout)
+        for sock in readable:
             try:
-                result = transport.receive()
+                if sock is transport.receiver:
+                    result = transport.receive()
+                else:
+                    result = transport.receive_v6()
             except OSError as error:
                 logging.warning("Reception failed: %s", error)
                 # A failed socket must not turn the event loop into a busy retry.
