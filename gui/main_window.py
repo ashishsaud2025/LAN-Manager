@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from ipaddress import IPv4Address, ip_address
 from pathlib import Path
 from queue import Empty
 import time
@@ -21,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from core.chat import ChatService
 from core.diagnostics import Neighbor, NeighborSnapshot, ProbeResult
-from core.discovery import local_ipv4_addresses
+from core.discovery import local_ipv4_addresses, local_ipv6_addresses
 from core.message_journal import MessageRecord
 from core.peer_repository import (
     CompatibilityState, DiscoveryState, PeerRecord, PeerRepositoryEvent,
@@ -69,6 +70,19 @@ PAGE_GAMES = 8
 PAGE_ACTIVITY = 9
 PAGE_SETTINGS = 10
 TERMINAL_TRANSFERS = {"failed", "cancelled", "declined", "saved", "verified"}
+
+
+def _has_ipv4_endpoint(record: PeerRecord) -> bool:
+    """Return whether any observed candidate can use IPv4 application paths."""
+    candidates = ([item.ip for item in record.endpoint_candidates]
+                  if record.endpoint_candidates else [record.ip])
+    for address in candidates:
+        try:
+            if isinstance(ip_address(address.partition("%")[0]), IPv4Address):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 class MainWindow(QMainWindow):
@@ -1204,8 +1218,9 @@ class MainWindow(QMainWindow):
         network_heading.setObjectName("PanelTitle")
         network_layout.addWidget(network_heading)
         network_detail = QLabel(
-            "Choose which local address carries UDP announcements. "
-            "Inbound discovery and TCP listeners remain on all interfaces.")
+            "Choose which local address carries announcements over IPv4 "
+            "broadcast and IPv6 link local multicast. Inbound discovery and "
+            "TCP listeners remain on all interfaces.")
         network_detail.setObjectName("PageSubtitle")
         network_detail.setWordWrap(True)
         network_layout.addWidget(network_detail)
@@ -1453,7 +1468,7 @@ class MainWindow(QMainWindow):
             current_sources, current_fallback, _ = self.service.discovery_selection()
         except (AttributeError, ValueError):
             current_sources, current_fallback = None, True
-        addresses = local_ipv4_addresses()
+        addresses = local_ipv4_addresses() + local_ipv6_addresses()
         self.discovery_address.blockSignals(True)
         self.discovery_address.clear()
         self.discovery_address.addItem("Automatic: all detected addresses", None)
@@ -2419,26 +2434,35 @@ class MainWindow(QMainWindow):
         fingerprint_line = (
             f"\nAdvertised certificate: {fingerprint}" if fingerprint is not None
             else "\nNo certificate fingerprint advertised by this session.")
+        has_ipv4 = _has_ipv4_endpoint(record)
+        transport_note = (
+            "" if has_ipv4 else
+            "\nApplication messaging, files, and probes need an IPv4 endpoint "
+            "on this build; this session is IPv6 discovery only.")
         self.peer_warning.setText(
             f"Cryptographic Trust: {trust_text}\n"
-            f"{self._trust_explanation(record)}{fingerprint_line}")
+            f"{self._trust_explanation(record)}{transport_note}"
+            f"{fingerprint_line}")
         live = record.nearby
         secure_capable = "secure_transport_v1" in record.hello.capabilities
         transport_allowed = (
             record.trust_state is not TrustState.KEY_CHANGED
             and (record.trust_state is not TrustState.PAIRED or secure_capable))
         self.peer_message_button.setEnabled(
-            live and transport_allowed and "chat_v1" in record.hello.capabilities)
+            live and has_ipv4 and transport_allowed
+            and "chat_v1" in record.hello.capabilities)
         self.peer_file_button.setEnabled(
-            live and transport_allowed and "file_v1" in record.hello.capabilities)
+            live and has_ipv4 and transport_allowed
+            and "file_v1" in record.hello.capabilities)
         self.peer_sync_button.setEnabled(
-            live and transport_allowed and "posts_v1" in record.hello.capabilities)
-        self.peer_ping_button.setEnabled(live)
-        self.peer_tcp_button.setEnabled(live)
+            live and has_ipv4 and transport_allowed
+            and "posts_v1" in record.hello.capabilities)
+        self.peer_ping_button.setEnabled(live and has_ipv4)
+        self.peer_tcp_button.setEnabled(live and has_ipv4)
         self.peer_copy_button.setEnabled(True)
-        self.peer_probe_button.setEnabled(live)
+        self.peer_probe_button.setEnabled(live and has_ipv4)
         self.peer_pair_button.setEnabled(
-            live and self.service.secure_transport is not None
+            live and has_ipv4 and self.service.secure_transport is not None
             and secure_capable
             and record.trust_state is TrustState.UNVERIFIED)
         self.peer_forget_button.setEnabled(

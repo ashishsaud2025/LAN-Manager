@@ -525,8 +525,8 @@ class ActivityListModel(QAbstractListModel):
 def capability_label(value: str) -> str:
     """Translate known wire capability names without hiding unknown values."""
     return {"chat_v1": "Chat", "file_v1": "Files", "posts_v1": "Posts",
-            "echo_v1": "Echo", "secure_transport_v1": "Secure TLS"}.get(
-                value, value)
+            "echo_v1": "Echo", "secure_transport_v1": "Secure TLS",
+            "ipv6_v1": "IPv6"}.get(value, value)
 
 
 def peer_trust_label(peer: PeerRecord) -> str:
