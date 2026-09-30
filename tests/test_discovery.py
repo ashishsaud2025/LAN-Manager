@@ -142,7 +142,8 @@ def test_bad_fields(key: str, value: object) -> None:
 def test_transport_filtering_and_recovery() -> None:
     receiver, sender = Mock(), Mock()
     with patch("core.discovery.socket.socket", side_effect=[receiver, sender]):
-        transport = DiscoveryTransport(SESSION, source_addresses=())
+        transport = DiscoveryTransport(
+            SESSION, source_addresses=(), enable_ipv6=False)
         own = GOLDEN
         other = encode_hello(Hello(PEER, PEER, "Other"))
         receiver.recvfrom.side_effect = [(own, ("192.0.2.1", 1234)),
@@ -178,7 +179,8 @@ def test_announcement_uses_each_bound_interface_and_tolerates_one_failure() -> N
     with patch("core.discovery.socket.socket",
                side_effect=[receiver, fallback, virtual, wifi]):
         transport = DiscoveryTransport(
-            SESSION, source_addresses=("192.168.56.1", "192.168.1.65"))
+            SESSION, source_addresses=("192.168.56.1", "192.168.1.65"),
+            enable_ipv6=False)
     transport.announce(Hello(PEER, SESSION, "Alice"))
     virtual.bind.assert_called_once_with(("192.168.56.1", 0))
     wifi.bind.assert_called_once_with(("192.168.1.65", 0))

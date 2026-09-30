@@ -21,7 +21,8 @@ def test_strict_selection_omits_fallback_sender() -> None:
     receiver, wifi = Mock(), Mock()
     with patch("core.discovery.socket.socket", side_effect=[receiver, wifi]):
         transport = DiscoveryTransport(
-            "self", source_addresses=("192.168.1.65",), include_fallback=False)
+            "self", source_addresses=("192.168.1.65",), include_fallback=False,
+            enable_ipv6=False)
         assert len(transport.senders) == 1
         transport.announce(_hello())
         wifi.sendto.assert_called_once()
@@ -36,7 +37,8 @@ def test_refresh_reuses_unchanged_senders() -> None:
     with patch("core.discovery.socket.socket",
                side_effect=[receiver, fallback, first, second, third]):
         transport = DiscoveryTransport(
-            "self", source_addresses=("192.168.1.10", "192.168.1.11"))
+            "self", source_addresses=("192.168.1.10", "192.168.1.11"),
+            enable_ipv6=False)
         assert transport.refresh_senders(
             ("192.168.1.11", "192.168.1.12"), True) is True
         assert set(transport.bound_addresses()) == {
@@ -54,7 +56,7 @@ def test_unavailable_selection_does_not_leak_through_fallback() -> None:
                side_effect=[receiver, failing]):
         transport = DiscoveryTransport(
             "self", source_addresses=("192.168.1.99",),
-            include_fallback=False)
+            include_fallback=False, enable_ipv6=False)
         assert transport.senders == []
         with pytest.raises(OSError):
             transport.announce(_hello())
