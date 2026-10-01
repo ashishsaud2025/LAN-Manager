@@ -29,6 +29,7 @@ from core.peer_repository import (
     ReachabilityState, TrustState,
 )
 from core.post_signatures import verify_post
+from core.forwarding import ForwardingService
 from core.portal import PORTAL_PORT, PortalServer
 from core.roster import Peer
 from core.secure_transport import PairingCandidate, SecureTransportError
@@ -90,7 +91,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self, service: ChatService,
                  portal: PortalServer | None = None,
-                 directory: LocalServiceDirectory | None = None) -> None:
+                 directory: LocalServiceDirectory | None = None,
+                 forwarder: ForwardingService | None = None) -> None:
         super().__init__()
         self.settings = QSettings("LAN Manager", "LAN Atlas")
         self.theme_mode = str(self.settings.value("appearance/theme", "observatory"))
@@ -113,6 +115,7 @@ class MainWindow(QMainWindow):
         self.portal = portal or PortalServer(
             service.hello, service.peer_repository, service.post_store,
             service.message_journal, self.directory)
+        self.forwarder = forwarder or ForwardingService()
         self.peer_records: tuple[PeerRecord, ...] = service.peer_repository.snapshot()
         self._peer_revision = 0
         self.peer_selection = PeerSelection()
@@ -1310,6 +1313,81 @@ class MainWindow(QMainWindow):
         portal_layout.addWidget(portal_warning)
         layout.addWidget(portal)
         self._refresh_portal_state()
+        forward = QFrame()
+        forward.setProperty("card", True)
+        forward_layout = QVBoxLayout(forward)
+        forward_header = QHBoxLayout()
+        forward_heading = QLabel("Loopback sharing")
+        forward_heading.setObjectName("PanelTitle")
+        self.forward_status = StatusPill("Stopped", "offline")
+        forward_header.addWidget(forward_heading)
+        forward_header.addStretch(1)
+        forward_header.addWidget(self.forward_status)
+        forward_layout.addLayout(forward_header)
+        forward_detail = QLabel(
+            "Expose one loopback-only project to the LAN through raw byte "
+            "forwarding. The listener binds one concrete LAN address; the "
+            "target must stay loopback. Stopping withdraws reachability.")
+        forward_detail.setObjectName("PageSubtitle")
+        forward_detail.setWordWrap(True)
+        forward_layout.addWidget(forward_detail)
+        forward_form = QGridLayout()
+        forward_form.addWidget(QLabel("Target host"), 0, 0)
+        self.forward_target_host = QLineEdit("127.0.0.1")
+        self.forward_target_host.setMaxLength(255)
+        self.forward_target_host.setAccessibleName("Forward target host")
+        forward_form.addWidget(self.forward_target_host, 0, 1)
+        forward_form.addWidget(QLabel("Target port"), 1, 0)
+        self.forward_target_port = QSpinBox()
+        self.forward_target_port.setRange(1, 65535)
+        self.forward_target_port.setValue(8000)
+        self.forward_target_port.setAccessibleName("Forward target port")
+        forward_form.addWidget(self.forward_target_port, 1, 1)
+        forward_form.addWidget(QLabel("Listener address"), 2, 0)
+        self.forward_address = QComboBox()
+        self.forward_address.setEditable(True)
+        self.forward_address.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.forward_address.setPlaceholderText("Enter a concrete IPv4 address")
+        forward_addresses = local_ipv4_addresses()
+        for address in forward_addresses:
+            self.forward_address.addItem(address, address)
+        if forward_addresses:
+            self.forward_address.setCurrentIndex(0)
+        self.forward_address.setAccessibleName("Forward listener address")
+        forward_form.addWidget(self.forward_address, 2, 1)
+        forward_form.addWidget(QLabel("Listener port"), 3, 0)
+        self.forward_port = QSpinBox()
+        self.forward_port.setRange(0, 65535)
+        self.forward_port.setValue(9000)
+        self.forward_port.setAccessibleName("Forward listener port")
+        forward_form.addWidget(self.forward_port, 3, 1)
+        forward_layout.addLayout(forward_form)
+        self.forward_stats = MonoLabel("Forwarder stopped")
+        self.forward_stats.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        forward_layout.addWidget(self.forward_stats)
+        forward_actions = QHBoxLayout()
+        self.forward_start = action_button(
+            "Start sharing", self._start_forwarding, True)
+        self.forward_stop = action_button("Stop", self._stop_forwarding)
+        self.forward_publish = action_button(
+            "Use in publication", self._use_forwarder_in_publication)
+        for button in (self.forward_start, self.forward_stop,
+                       self.forward_publish):
+            forward_actions.addWidget(button)
+        self.forward_address.currentTextChanged.connect(
+            lambda _text: self._refresh_forwarder_state())
+        forward_actions.addStretch(1)
+        forward_layout.addLayout(forward_actions)
+        forward_warning = QLabel(
+            "Forwarding copies raw bytes and does not repair application "
+            "assumptions: Host validation, absolute localhost URLs, redirects, "
+            "CORS, cookies, TLS names, and WebSocket URL configuration.")
+        forward_warning.setObjectName("PageSubtitle")
+        forward_warning.setWordWrap(True)
+        forward_layout.addWidget(forward_warning)
+        layout.addWidget(forward)
+        self._refresh_forwarder_state()
         publications = QFrame()
         publications.setProperty("card", True)
         publication_layout = QVBoxLayout(publications)
@@ -1583,6 +1661,89 @@ class MainWindow(QMainWindow):
         url = self.portal.state().url
         if url is not None:
             QApplication.clipboard().setText(url)
+
+    @Slot()
+    def _start_forwarding(self) -> None:
+        """Expose one loopback target on the selected LAN listener."""
+        address = self.forward_address.currentText().strip()
+        if not address:
+            self.append("Select a concrete LAN interface before sharing.",
+                        "Services", "warning")
+            return
+        try:
+            state = self.forwarder.start(
+                address, self.forward_port.value(),
+                self.forward_target_host.text(),
+                self.forward_target_port.value())
+        except (OSError, RuntimeError, ValueError) as error:
+            self.append(f"Sharing start failed: {error}", "Services", "warning")
+            self._refresh_forwarder_state()
+            return
+        self.append(f"Sharing loopback {state.target_host}:{state.target_port} "
+                    f"at {state.listen_host}:{state.listen_port}.", "Services")
+        self._refresh_forwarder_state()
+
+    @Slot()
+    def _stop_forwarding(self) -> None:
+        """Withdraw the LAN endpoint without waiting in the Qt event loop."""
+        previous = self.forwarder.state()
+        self.forwarder.stop()
+        self.append("Sharing stop requested; the endpoint is withdrawn.",
+                    "Services")
+        if (previous.phase == "running" and previous.listen_host is not None
+                and previous.listen_port is not None):
+            stale = [entry for entry in self.directory.snapshot().entries
+                     if entry.host == previous.listen_host
+                     and entry.port == previous.listen_port]
+            if stale:
+                names = ", ".join(entry.name for entry in stale[:3])
+                self.append(f"Withdraw {names} separately; publications "
+                            "do not follow the forwarder automatically.",
+                            "Services", "warning")
+        self._refresh_forwarder_state()
+
+    @Slot()
+    def _use_forwarder_in_publication(self) -> None:
+        """Prefill the publication form with the live forwarding endpoint."""
+        state = self.forwarder.state()
+        if state.phase != "running" or state.listen_host is None:
+            self.append("Start sharing before using it in a publication.",
+                        "Services", "warning")
+            return
+        self.directory_selector.setCurrentIndex(0)
+        self.directory_host.setEditText(state.listen_host)
+        self.directory_port.setValue(state.listen_port or 9000)
+        self.append("Publication form now points at the shared endpoint. "
+                    "Name it and publish locally.", "Services")
+
+    def _refresh_forwarder_state(self) -> None:
+        """Render one thread-safe forwarding lifecycle snapshot."""
+        state = self.forwarder.state()
+        running = state.phase == "running"
+        if running:
+            self.forward_status.setText("Sharing")
+            self.forward_status.set_state("reachable")
+        elif state.phase == "stopping":
+            self.forward_status.setText("Stopping")
+            self.forward_status.set_state("unverified")
+        elif state.phase == "failed":
+            self.forward_status.setText("Failed")
+            self.forward_status.set_state("unverified")
+        else:
+            self.forward_status.setText("Stopped")
+            self.forward_status.set_state("offline")
+        if running and state.listen_host is not None:
+            self.forward_stats.setText(
+                f"{state.target_host}:{state.target_port} available at "
+                f"{state.listen_host}:{state.listen_port} · "
+                f"{state.active} active · {state.total_connections} total · "
+                f"{human_bytes(float(state.bytes_relayed))} relayed")
+        elif state.phase == "failed":
+            self.forward_stats.setText(f"Sharing failed: {state.error}")
+        else:
+            self.forward_stats.setText("Forwarder stopped")
+        self.forward_start.setEnabled(state.phase in ("stopped", "failed"))
+        self.forward_stop.setEnabled(running)
 
     def _refresh_portal_state(self) -> None:
         """Render one thread-safe portal lifecycle snapshot."""
@@ -2137,6 +2298,7 @@ class MainWindow(QMainWindow):
         if now >= self._next_presence_refresh:
             self._next_presence_refresh = now + 1.0
             self._refresh_portal_state()
+            self._refresh_forwarder_state()
             self.peer_model.refresh_ages()
             self.peer_table_model.refresh_ages()
             record = self._selected_record()
@@ -2982,5 +3144,6 @@ class MainWindow(QMainWindow):
         """Cancel core work; the entry point joins after the Qt loop exits."""
         self.timer.stop()
         self.portal.stop()
+        self.forwarder.stop()
         self.service.stop()
         event.accept()

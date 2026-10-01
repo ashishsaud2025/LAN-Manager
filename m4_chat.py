@@ -119,6 +119,9 @@ def main() -> int:
         window.portal.stop()
         if not window.portal.join():
             logging.error("Portal worker did not finish within shutdown deadline")
+        window.forwarder.stop()
+        if not window.forwarder.join():
+            logging.error("Forward worker did not finish within shutdown deadline")
         service.stop()
         if not service.join():
             logging.error("Network workers did not finish within shutdown deadline")
