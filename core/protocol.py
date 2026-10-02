@@ -16,7 +16,9 @@ MAX_FILE_SIZE = 1024 * 1024 * 1024
 IO_TIMEOUT = 5.0
 MESSAGE_TYPES = {"ECHO", "ECHO_REPLY", "CHAT", "ACK", "ERROR", "FILE_OFFER",
                  "FILE_ACCEPT", "FILE_DECLINE", "FILE_CHUNK", "FILE_DONE",
-                 "FILE_RESULT", "POST_QUERY", "POST_PAGE"}
+                 "FILE_RESULT", "POST_QUERY", "POST_PAGE",
+                 "DIR_QUERY", "DIR_PAGE"}
+DIR_PAGE_LIMIT_MAX = 50
 
 
 class ProtocolError(ValueError):
@@ -124,7 +126,7 @@ def validate_envelope(message: dict[str, Any]) -> None:
     body = message.get("body")
     if not isinstance(body, dict):
         raise ProtocolError("body must be an object")
-    if message["type"] in {"ECHO_REPLY", "ACK", "ERROR", "POST_PAGE"}:
+    if message["type"] in {"ECHO_REPLY", "ACK", "ERROR", "POST_PAGE", "DIR_PAGE"}:
         try:
             UUID(message.get("reply_to", ""))
         except (ValueError, TypeError, AttributeError) as error:
@@ -210,6 +212,38 @@ def validate_envelope(message: dict[str, Any]) -> None:
             raise ProtocolError("empty post page must be complete")
         if not body["complete"] and next_cursor is None:
             raise ProtocolError("incomplete post page requires next cursor")
+    if message["type"] == "DIR_QUERY":
+        from core.directory_sync import validate_cursor as validate_dir_cursor
+        try:
+            validate_dir_cursor(body.get("cursor"))
+        except ValueError as error:
+            raise ProtocolError("invalid directory cursor") from error
+        if type(body.get("limit")) is not int or not 1 <= body["limit"] <= DIR_PAGE_LIMIT_MAX:
+            raise ProtocolError("directory page limit must be 1 to 50")
+        kind = body.get("kind")
+        if kind is not None and kind not in {"service", "game"}:
+            raise ProtocolError("directory kind must be service, game, or null")
+    if message["type"] == "DIR_PAGE":
+        from core.services import validate_directory_entry
+        from core.directory_sync import validate_cursor as validate_dir_cursor
+        entries = body.get("entries")
+        if not isinstance(entries, list) or len(entries) > DIR_PAGE_LIMIT_MAX:
+            raise ProtocolError("directory page must list at most 50 entries")
+        try:
+            for raw in entries:
+                validate_directory_entry(raw)
+        except ValueError as error:
+            raise ProtocolError("invalid entry in directory page") from error
+        try:
+            next_cursor = validate_dir_cursor(body.get("next_cursor"))
+        except ValueError as error:
+            raise ProtocolError("invalid directory next cursor") from error
+        if type(body.get("complete")) is not bool:
+            raise ProtocolError("directory page requires complete flag")
+        if not entries and not body["complete"]:
+            raise ProtocolError("empty directory page must be complete")
+        if not body["complete"] and next_cursor is None:
+            raise ProtocolError("incomplete directory page requires next cursor")
 
 
 def envelope(kind: str, peer_id: str, session_id: str, body: dict[str, Any],

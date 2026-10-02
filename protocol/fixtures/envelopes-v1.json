@@ -100,6 +100,41 @@
         },
         "complete": true
       }
+    },
+    {
+      "version": 1,
+      "type": "DIR_QUERY",
+      "message_id": "00000000-0000-4000-8000-000000000011",
+      "peer_id": "00000000-0000-4000-8000-000000000002",
+      "session_id": "00000000-0000-4000-8000-000000000003",
+      "body": {"cursor": null, "limit": 50, "kind": null}
+    },
+    {
+      "version": 1,
+      "type": "DIR_PAGE",
+      "message_id": "00000000-0000-4000-8000-000000000012",
+      "peer_id": "00000000-0000-4000-8000-000000000006",
+      "session_id": "00000000-0000-4000-8000-000000000007",
+      "reply_to": "00000000-0000-4000-8000-000000000011",
+      "body": {
+        "entries": [{
+          "service_id": "00000000-0000-4000-8000-000000000013",
+          "owner_peer_id": "00000000-0000-4000-8000-000000000006",
+          "owner_session_id": "00000000-0000-4000-8000-000000000007",
+          "owner_name": "Holder",
+          "kind": "service",
+          "name": "Shared project",
+          "description": "Cached LAN service",
+          "scheme": "http",
+          "host": "192.168.1.20",
+          "port": 8000,
+          "path": "/"
+        }],
+        "next_cursor": {
+          "last_service": "00000000-0000-4000-8000-000000000013"
+        },
+        "complete": true
+      }
     }
   ]
 }
