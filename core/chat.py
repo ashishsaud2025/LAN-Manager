@@ -12,6 +12,8 @@ import time
 from typing import Any
 from uuid import uuid4
 
+from core.directory_sync import merge_page as merge_directory_page
+from core.directory_sync import serve_query as serve_directory_query
 from core.discovery import (
     DiscoveryTransport, Hello, encode_hello, local_ipv4_addresses,
     local_ipv6_addresses,
@@ -19,6 +21,7 @@ from core.discovery import (
 from core.diagnostics import DiagnosticsService
 from core.feed import merge_page, serve_query
 from core.message_journal import MessageJournal
+from core.services import LocalServiceDirectory, RemoteDirectoryCache
 from core.peer_repository import (
     PeerRepository, PeerRepositoryEvent, TrustState,
 )
@@ -46,7 +49,8 @@ class ChatService:
                  message_journal: MessageJournal | None = None,
                  secure_transport: SecureTransport | None = None,
                  discovery_source_addresses: tuple[str, ...] | None = None,
-                 discovery_include_fallback: bool = True) -> None:
+                 discovery_include_fallback: bool = True,
+                 directory: LocalServiceDirectory | None = None) -> None:
         self.hello = hello
         encode_hello(hello)
         if (secure_transport is not None
@@ -80,6 +84,11 @@ class ChatService:
         self.peer_repository = PeerRepository(
             trust_resolver=self._resolve_trust)
         self.post_store = post_store
+        self.directory = directory or LocalServiceDirectory(hello)
+        if self.directory.owner is not hello:
+            raise ValueError("directory must belong to the local session")
+        self.remote_catalog = RemoteDirectoryCache()
+        self._directory_cursors: dict[str, dict[str, Any] | None] = {}
         self.message_journal = message_journal or MessageJournal()
         if self.secure_transport is not None:
             self.secure_transport.emit = self._event
@@ -175,6 +184,19 @@ class ChatService:
         message = envelope("POST_QUERY", self.hello.peer_id, self.hello.session_id,
                            {"cursor": self._sync_cursors.get(peer.hello.session_id),
                             "limit": 50, "author_id": None})
+        try:
+            self._outgoing.put_nowait((peer, message))
+        except Full as error:
+            raise RuntimeError("outbound queue full") from error
+        return message["message_id"]
+
+    def sync_directory(self, peer: Peer) -> str:
+        """Queue a bounded catalog sync from one peer without blocking the UI."""
+        if "directory_v1" not in peer.hello.capabilities:
+            raise ValueError("peer does not advertise directory_v1")
+        message = envelope("DIR_QUERY", self.hello.peer_id, self.hello.session_id,
+                           {"cursor": self._directory_cursors.get(peer.hello.session_id),
+                            "limit": 50, "kind": None})
         try:
             self._outgoing.put_nowait((peer, message))
         except Full as error:
@@ -341,6 +363,9 @@ class ChatService:
                 event = self.peer_repository.reconcile_presence(peers, now)
                 if event is not None:
                     self._queue_repository_event(event)
+                    keep = {record.hello.peer_id for record in
+                            self.peer_repository.snapshot()}
+                    self.remote_catalog.evict_owners(keep)
                 self.flush_repository_events()
         except OSError as error:
             self._event("status", f"Discovery stopped: {error}")
@@ -506,6 +531,12 @@ class ChatService:
                                         self.hello.session_id, body,
                                         message["message_id"]))
             return False
+        if message["type"] == "DIR_QUERY":
+            body = serve_directory_query(self.directory, message["body"])
+            send_message(conn, envelope("DIR_PAGE", self.hello.peer_id,
+                                        self.hello.session_id, body,
+                                        message["message_id"]))
+            return False
         if message["type"] != "CHAT":
             raise ProtocolError("listener does not accept this message type")
         body = message["body"]
@@ -621,6 +652,9 @@ class ChatService:
                 if message["type"] == "POST_QUERY":
                     self._sync_peer(peer, message)
                     continue
+                if message["type"] == "DIR_QUERY":
+                    self._sync_directory_peer(peer, message)
+                    continue
                 conn, authenticated = self._connect_peer(peer)
                 self._track(conn, True)
                 with conn:
@@ -691,6 +725,60 @@ class ChatService:
                                 "author_id": None})
         self._event("feed_updated", {"added": added, "duplicates": duplicates,
                                      "partial": True})
+
+    def _sync_directory_peer(self, peer: Peer, query: dict[str, Any]) -> None:
+        """Fetch bounded catalog pages, retaining a continuation cursor if capped."""
+        added = duplicates = 0
+        authenticated = False
+        current = query
+        for _ in range(MAX_SYNC_PAGES):
+            conn, authenticated = self._connect_peer(peer)
+            self._track(conn, True)
+            try:
+                with conn:
+                    send_message(conn, current)
+                    reply = recv_message(conn)
+            finally:
+                self._track(conn, False)
+            if reply is None:
+                raise ProtocolError("no directory page response")
+            validate_envelope(reply)
+            if (reply["type"] != "DIR_PAGE"
+                    or reply["reply_to"] != current["message_id"]
+                    or reply["peer_id"] != peer.hello.peer_id
+                    or reply["session_id"] != peer.hello.session_id):
+                raise ProtocolError("invalid directory page response")
+            for raw in reply["body"]["entries"]:
+                if (not isinstance(raw, dict)
+                        or raw.get("owner_peer_id") != peer.hello.peer_id
+                        or raw.get("owner_session_id") != peer.hello.session_id):
+                    raise ProtocolError("directory entry owner differs from sender")
+            page_added, page_duplicates = merge_directory_page(
+                self.remote_catalog, reply["body"]["entries"])
+            added += page_added
+            duplicates += page_duplicates
+            cursor = reply["body"]["next_cursor"]
+            if reply["body"]["complete"]:
+                self._directory_cursors.pop(peer.hello.session_id, None)
+                self._event("directory_updated", {"added": added,
+                                                  "duplicates": duplicates,
+                                                  "authenticated": authenticated})
+                return
+            self._store_directory_cursor(peer.hello.session_id, cursor)
+            current = envelope("DIR_QUERY", self.hello.peer_id,
+                               self.hello.session_id,
+                               {"cursor": cursor, "limit": 50, "kind": None})
+        self._event("directory_updated", {"added": added, "duplicates": duplicates,
+                                          "partial": True,
+                                          "authenticated": authenticated})
+
+    def _store_directory_cursor(self, session_id: str,
+                                cursor: dict[str, Any] | None) -> None:
+        """Retain one continuation cursor with a bounded session table."""
+        if len(self._directory_cursors) >= 64 and session_id not in self._directory_cursors:
+            oldest = next(iter(self._directory_cursors))
+            del self._directory_cursors[oldest]
+        self._directory_cursors[session_id] = cursor
 
 
 def _validate_discovery_sources(

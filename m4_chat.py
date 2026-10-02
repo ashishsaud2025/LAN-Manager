@@ -16,6 +16,7 @@ from core.chat import ChatService
 from core.discovery import IPV6_CAPABILITY, Hello, ipv6_supported
 from core.identity import DeviceIdentity
 from core.secure_transport import SECURE_PORT, SecureTransport
+from core.services import LocalServiceDirectory
 from core.storage import JsonLinesPostStore
 from core.trust import TrustStore
 from gui.main_window import MainWindow
@@ -83,7 +84,7 @@ def main() -> int:
         identity = DeviceIdentity.load_or_create(
             args.security_identity_file, peer_id)
         capabilities = ["chat_v1", "file_v1", "posts_v1",
-                          "secure_transport_v1"]
+                          "secure_transport_v1", "directory_v1"]
         if ipv6_supported():
             capabilities.append(IPV6_CAPABILITY)
         hello = Hello(
@@ -105,7 +106,8 @@ def main() -> int:
                               JsonLinesPostStore(args.post_file),
                               secure_transport=secure_transport,
                               discovery_source_addresses=sources,
-                              discovery_include_fallback=fallback)
+                              discovery_include_fallback=fallback,
+                              directory=LocalServiceDirectory(hello))
     except (ValueError, OSError) as error:
         logging.error("Startup failed: %s", error)
         return 1
