@@ -78,7 +78,7 @@ def main(runner: Callable[[Hello, DiscoveryTransport], None] = run) -> int:
     parser.add_argument("--reuse-address", action="store_true",
                         help="opt in to OS-dependent same-host UDP sharing")
     parser.add_argument("--source-address", action="append", default=None,
-                        help="also announce from one local IP address, with %scope "
+                        help="also announce from one local IP address, with %%scope "
                              "for IPv6 link local; repeatable unless --no-fallback")
     parser.add_argument("--no-fallback", action="store_true",
                         help="do not also announce through the OS default route")
