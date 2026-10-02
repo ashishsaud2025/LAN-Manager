@@ -1,0 +1,20 @@
+# PyInstaller desktop packaging output plus spec
+dist/
+build/
+*.spec
+
+# Python bytecode plus test caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Key material plus live identity, trust, and post data stay out of Git
+*.pem
+*.key
+peer-id
+trust.json
+posts.jsonl
+
+# Understand-Anything local analysis data
+.ua/
