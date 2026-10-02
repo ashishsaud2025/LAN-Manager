@@ -111,7 +111,9 @@ class MainWindow(QMainWindow):
                 directory = content.directory_store
             elif content.directory_store is not directory:
                 raise ValueError("portal must share the desktop service directory")
-        self.directory = directory or LocalServiceDirectory(service.hello)
+        self.directory = directory or service.directory
+        if self.directory.owner is not service.hello:
+            raise ValueError("directory must belong to the local session")
         self.portal = portal or PortalServer(
             service.hello, service.peer_repository, service.post_store,
             service.message_journal, self.directory)
@@ -876,6 +878,15 @@ class MainWindow(QMainWindow):
         self.service_view.selectionModel().currentChanged.connect(
             lambda _current, _previous: self._update_directory_open())
         layout.addWidget(self.directory_tabs, 1)
+        sync_row = QHBoxLayout()
+        self.directory_peer = QComboBox()
+        self.directory_peer.setAccessibleName("Directory synchronization source")
+        self.directory_peer.addItem("Select one directory-capable peer", None)
+        self.directory_sync = action_button(
+            "Sync selected peer", self._sync_directory)
+        sync_row.addWidget(self.directory_peer, 1)
+        sync_row.addWidget(self.directory_sync)
+        layout.addLayout(sync_row)
         actions = QHBoxLayout()
         self.directory_open = action_button(
             "Open selected HTTP service", self._open_directory_entry, True)
@@ -1842,10 +1853,20 @@ class MainWindow(QMainWindow):
         self.append(f"Withdrew {entry.kind.value} {entry.name!r}.", "Services")
 
     def _refresh_directory(self, selected_id: str | None = None) -> None:
-        """Project one shared directory snapshot into desktop models and controls."""
+        """Project local plus cached catalog snapshots into desktop models."""
         snapshot = self.directory.snapshot()
-        self.game_model.set_entries(snapshot.entries)
-        self.service_model.set_entries(snapshot.entries)
+        cached = self.service.remote_catalog.snapshot()
+        local_ids = {entry.service_id for entry in snapshot.entries}
+        extra = tuple(entry for entry in cached
+                      if entry.service_id not in local_ids)
+        combined = tuple(sorted(snapshot.entries + extra,
+                                key=lambda entry: (
+                                    entry.kind.value, entry.name.casefold(),
+                                    entry.service_id)))
+        cached_ids = frozenset((entry.owner_peer_id, entry.service_id)
+                               for entry in extra)
+        self.game_model.set_entries(combined, cached_ids)
+        self.service_model.set_entries(combined, cached_ids)
         if selected_id is None:
             current = self.directory_selector.currentData()
             selected_id = current if isinstance(current, str) else None
@@ -2274,6 +2295,14 @@ class MainWindow(QMainWindow):
                 self.refresh_feed()
             elif kind == "post_published":
                 self.refresh_feed()
+            elif kind == "directory_updated":
+                suffix = "; more pages available" if value.get("partial") else ""
+                security = ("authenticated TLS" if value.get("authenticated")
+                            else "unverified plaintext")
+                self.append(f"Directory sync: {value['added']} added, "
+                            f"{value['duplicates']} duplicates over {security}"
+                            f"{suffix}", "Services")
+                self._refresh_directory()
             elif kind == "neighbor_snapshot":
                 self._show_neighbor_snapshot(value)
             elif kind == "diagnostic_started":
@@ -2326,6 +2355,7 @@ class MainWindow(QMainWindow):
             for record in self.peer_records}
         message_selected = self.recipient.currentData()
         feed_selected = self.feed_peer.currentData()
+        directory_selected = self.directory_peer.currentData()
         self.peer_records = records
         nearby = tuple(record for record in records if record.nearby)
         self.peer_model.set_records(nearby)
@@ -2337,6 +2367,7 @@ class MainWindow(QMainWindow):
             self.overview_peer_list if nearby else self.overview_nearby_empty)
         self._rebuild_message_recipients(message_selected)
         self._rebuild_feed_peers(feed_selected)
+        self._rebuild_directory_peers(directory_selected)
         self.peer_selection.reconcile({record.session_id for record in records})
         if self.peer_selection.session_id is None and records:
             self.peer_selection.select(records[0].session_id)
@@ -2410,6 +2441,36 @@ class MainWindow(QMainWindow):
             index = self.recipient.count() - 1
         self.recipient.setCurrentIndex(max(0, index))
         self.recipient.blockSignals(False)
+
+    def _rebuild_directory_peers(self, selected: object) -> None:
+        self.directory_peer.clear()
+        self.directory_peer.addItem("Select one directory-capable peer", None)
+        for record in self.peer_records:
+            if not record.nearby or "directory_v1" not in record.hello.capabilities:
+                continue
+            self.directory_peer.addItem(
+                f"{record.hello.name} · {record.ip}", record.session_id)
+        index = self.directory_peer.findData(selected)
+        self.directory_peer.setCurrentIndex(max(0, index))
+
+    @Slot()
+    def _sync_directory(self) -> None:
+        """Queue a catalog sync from the explicitly selected capable peer."""
+        selected = self.directory_peer.currentData()
+        record = self.service.peer_repository.get(
+            selected if isinstance(selected, str) else None)
+        if (record is None or not record.nearby
+                or "directory_v1" not in record.hello.capabilities):
+            self.append("Select one directory-capable peer before syncing.",
+                        "Services", "warning")
+            return
+        try:
+            identifier = self.service.sync_directory(record.as_peer())
+        except (ValueError, RuntimeError) as error:
+            self.append(str(error), "Services", "warning")
+            return
+        self.append(f"Directory sync {identifier[:8]}… queued from "
+                    f"{record.hello.name}.", "Services")
 
     def _rebuild_feed_peers(self, selected: object) -> None:
         self.feed_peer.clear()

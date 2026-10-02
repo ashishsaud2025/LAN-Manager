@@ -294,6 +294,7 @@ class DirectoryListModel(QAbstractListModel):
         super().__init__()
         self.kind = kind
         self.entries: tuple[DirectoryEntry, ...] = ()
+        self.cached_ids: frozenset[tuple[str, str]] = frozenset()
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.entries)
@@ -302,21 +303,29 @@ class DirectoryListModel(QAbstractListModel):
         if not index.isValid() or not 0 <= index.row() < len(self.entries):
             return None
         entry = self.entries[index.row()]
+        key = (entry.owner_peer_id, entry.service_id)
+        if key in self.cached_ids:
+            provenance = (f"Cached copy · from {entry.owner_name} · "
+                          "may be stale or withdrawn")
+        else:
+            provenance = "Published locally"
         if role == Qt.ItemDataRole.DisplayRole:
             description = entry.description or "No description"
             return (f"{entry.name}\n{browser_url(entry)}\n{description}\n"
-                    "Published locally · Reachability not checked · Health not defined")
+                    f"{provenance} · Reachability not checked · Health not defined")
         if role == self.EntryRole:
             return entry
         if role == Qt.ItemDataRole.AccessibleTextRole:
-            return (f"{entry.kind.value} {entry.name}, published locally at "
+            return (f"{entry.kind.value} {entry.name}, {provenance.lower()} at "
                     f"{browser_url(entry)}, reachability not checked, health not defined")
         return None
 
-    def set_entries(self, entries: tuple[DirectoryEntry, ...]) -> None:
+    def set_entries(self, entries: tuple[DirectoryEntry, ...],
+                    cached_ids: frozenset[tuple[str, str]] = frozenset()) -> None:
         """Replace one complete filtered directory snapshot."""
         self.beginResetModel()
         self.entries = tuple(entry for entry in entries if entry.kind is self.kind)
+        self.cached_ids = cached_ids
         self.endResetModel()
 
     def entry_at(self, row: int) -> DirectoryEntry | None:
@@ -526,7 +535,7 @@ def capability_label(value: str) -> str:
     """Translate known wire capability names without hiding unknown values."""
     return {"chat_v1": "Chat", "file_v1": "Files", "posts_v1": "Posts",
             "echo_v1": "Echo", "secure_transport_v1": "Secure TLS",
-            "ipv6_v1": "IPv6"}.get(value, value)
+            "ipv6_v1": "IPv6", "directory_v1": "Directory"}.get(value, value)
 
 
 def peer_trust_label(peer: PeerRecord) -> str:
