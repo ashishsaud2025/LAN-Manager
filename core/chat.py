@@ -4,16 +4,20 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import logging
+from pathlib import Path
 from queue import Empty, Full, Queue
 import select
 import socket
+import tempfile
 import threading
 import time
 from typing import Any
 from uuid import uuid4
 
+from core.addressbook import AddressBook
 from core.directory_sync import merge_page as merge_directory_page
 from core.directory_sync import serve_query as serve_directory_query
+from core.scope import is_internet_host
 from core.discovery import (
     DiscoveryTransport, Hello, encode_hello, local_ipv4_addresses,
     local_ipv6_addresses,
@@ -37,6 +41,7 @@ from core.storage import PostStore
 from core.transfer import TransferService
 
 MAX_SYNC_PAGES = 20
+_DIAL_CACHE_TTL = 120.0
 
 
 class ChatService:
@@ -50,7 +55,8 @@ class ChatService:
                  secure_transport: SecureTransport | None = None,
                  discovery_source_addresses: tuple[str, ...] | None = None,
                  discovery_include_fallback: bool = True,
-                 directory: LocalServiceDirectory | None = None) -> None:
+                 directory: LocalServiceDirectory | None = None,
+                 address_book: AddressBook | Path | str | None = None) -> None:
         self.hello = hello
         encode_hello(hello)
         if (secure_transport is not None
@@ -89,6 +95,20 @@ class ChatService:
             raise ValueError("directory must belong to the local session")
         self.remote_catalog = RemoteDirectoryCache()
         self._directory_cursors: dict[str, dict[str, Any] | None] = {}
+        self._dial_cache: dict[str, tuple[str, str, float]] = {}
+        if isinstance(address_book, AddressBook):
+            self.address_book = address_book
+            self._book_dir: tempfile.TemporaryDirectory[str] | None = None
+        else:
+            if address_book is None:
+                self._book_dir = tempfile.TemporaryDirectory(
+                    prefix="lan-atlas-book-")
+                holder: Path | str = (
+                    Path(self._book_dir.name) / "addressbook.json")
+            else:
+                self._book_dir = None
+                holder = address_book
+            self.address_book = AddressBook(Path(holder))
         self.message_journal = message_journal or MessageJournal()
         if self.secure_transport is not None:
             self.secure_transport.emit = self._event
@@ -203,12 +223,52 @@ class ChatService:
             raise RuntimeError("outbound queue full") from error
         return message["message_id"]
 
+    def dial_peer(self, peer_id: str) -> Peer:
+        """Resolve one address book entry to a live Peer via TLS probe."""
+        if self.secure_transport is None:
+            raise RuntimeError("secure transport is not configured")
+        entry = self.address_book.get(peer_id)
+        if entry is None:
+            raise ValueError("no address book entry for peer")
+        trust = self.secure_transport.trust_store
+        record = trust.get(entry.peer_id)
+        if record is None:
+            raise ValueError("entry peer is not paired; pair on LAN first")
+        if record.fingerprint != entry.fingerprint:
+            raise ValueError("entry certificate differs from paired key")
+        cached = self._dial_cache.get(entry.peer_id)
+        if (cached is not None
+                and time.monotonic() - cached[2] < _DIAL_CACHE_TTL):
+            session_id, address = cached[0], cached[1]
+        else:
+            try:
+                session_id, address = self.secure_transport.probe_session(
+                    entry.host, entry.port, entry.peer_id)
+            except (OSError, SecureTransportError, ValueError) as error:
+                raise ValueError(f"dial failed: {error}") from error
+            self._dial_cache[entry.peer_id] = (
+                session_id, address, time.monotonic())
+        hello = Hello(entry.peer_id, session_id, entry.label, entry.port,
+                      entry.capabilities, entry.port, entry.fingerprint)
+        return Peer(hello, address, time.monotonic())
+
+    def _drop_dial_cache(self, peer_id: str) -> None:
+        """Forget one probed session so the next dial re-resolves it."""
+        self._dial_cache.pop(peer_id, None)
+
     def request_pair(self, peer: Peer) -> bool:
         """Queue one pairing request without blocking the caller."""
         if self.secure_transport is None:
             raise RuntimeError("secure transport is not configured")
         if self._stop.is_set():
             raise RuntimeError("service is stopping")
+        for address in candidate_ips(peer):
+            try:
+                scoped = is_internet_host(address)
+            except ValueError as error:
+                raise ValueError(f"pair peer address invalid: {error}") from error
+            if scoped:
+                raise ValueError("pair over Internet refused; pair on LAN first")
         try:
             self._pairing.put_nowait(peer)
             return True
@@ -468,7 +528,8 @@ class ChatService:
             transferred = False
             try:
                 try:
-                    channel = transport.accept(raw)
+                    channel = transport.accept(
+                        raw, allow_pairing=self._pairing_allowed(raw))
                 except (OSError, SecureTransportError, ValueError) as error:
                     self._event("status", f"Secure handshake failed: {error}")
                     continue
@@ -563,6 +624,17 @@ class ChatService:
                                     message["message_id"]))
         return False
 
+    def _pairing_allowed(self, raw: socket.socket) -> bool:
+        """Refuse inbound pairing from Internet scope; auth stays allowed."""
+        try:
+            source = raw.getpeername()[0]
+        except OSError:
+            return False
+        try:
+            return not is_internet_host(source)
+        except ValueError:
+            return False
+
     def _track(self, conn: socket.socket, add: bool) -> None:
         close_now = False
         with self._lock:
@@ -581,9 +653,17 @@ class ChatService:
 
     def _connect_peer(self, peer: Peer) -> tuple[socket.socket, bool]:
         addresses = candidate_ips(peer)
-        if (self.secure_transport is not None
-                and self.secure_transport.trust_store.get(peer.hello.peer_id)
-                is not None):
+        paired = (self.secure_transport is not None
+                  and self.secure_transport.trust_store.get(peer.hello.peer_id)
+                  is not None)
+        try:
+            internet = any(is_internet_host(address) for address in addresses)
+        except ValueError as error:
+            raise ValueError(f"peer address invalid: {error}") from error
+        if internet and not paired:
+            raise ValueError("unpaired Internet dial refused; pair on LAN first")
+        if paired:
+            assert self.secure_transport is not None
             error: Exception | None = None
             for address in addresses:
                 attempt = Peer(peer.hello, address, peer.last_seen,
@@ -675,6 +755,7 @@ class ChatService:
                 self._event("status", f"Accepted {message['message_id']} by {peer.hello.name}")
             except (OSError, SecureTransportError, ValueError) as error:
                 state = "uncertain" if transmission_started else "failed"
+                self._drop_dial_cache(peer.hello.peer_id)
                 self.message_journal.update_delivery(
                     message["message_id"], peer.hello.session_id, state,
                     str(error))
