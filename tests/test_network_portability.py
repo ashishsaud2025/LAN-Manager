@@ -107,15 +107,15 @@ def test_chat_falls_back_to_second_candidate() -> None:
     service = ChatService(Hello(str(uuid4()), str(uuid4()), "Local"))
     target = Hello(str(uuid4()), str(uuid4()), "Remote")
     roster = PeerRoster("other")
-    roster.update(target, "192.0.2.1", 0)
-    roster.update(target, "192.0.2.2", 1)
+    roster.update(target, "192.168.99.1", 0)
+    roster.update(target, "192.168.99.2", 1)
     multi = roster.snapshot()[0]
-    assert multi.ip == "192.0.2.2"
+    assert multi.ip == "192.168.99.2"
     calls: list[str] = []
 
     def fake_connect(address: tuple[str, int], timeout: float = 3) -> Mock:
         calls.append(address[0])
-        if address[0] == "192.0.2.2":
+        if address[0] == "192.168.99.2":
             raise OSError("unreachable")
         return Mock()
 
@@ -123,7 +123,7 @@ def test_chat_falls_back_to_second_candidate() -> None:
         conn, authenticated = service._connect_peer(multi)
         assert authenticated is False
         conn.close()
-    assert calls == ["192.0.2.2", "192.0.2.1"]
+    assert calls == ["192.168.99.2", "192.168.99.1"]
 
 
 def test_discovery_selection_updates_without_sockets() -> None:
