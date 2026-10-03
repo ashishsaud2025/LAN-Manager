@@ -15,9 +15,9 @@ from PySide6.QtGui import (QCloseEvent, QDesktopServices, QKeySequence,
 from PySide6.QtWidgets import (
     QAbstractButton, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QListView, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QSpinBox, QSplitter, QStackedWidget, QTableView, QTabWidget,
-    QTextEdit, QVBoxLayout, QWidget,
+    QLineEdit, QListView, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter,
+    QStackedWidget, QTableView, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from core.chat import ChatService
@@ -1399,6 +1399,54 @@ class MainWindow(QMainWindow):
         forward_layout.addWidget(forward_warning)
         layout.addWidget(forward)
         self._refresh_forwarder_state()
+        internet = QFrame()
+        internet.setProperty("card", True)
+        internet_layout = QVBoxLayout(internet)
+        internet_heading = QLabel("Internet peers")
+        internet_heading.setObjectName("PanelTitle")
+        internet_layout.addWidget(internet_heading)
+        internet_detail = QLabel(
+            "Dial paired peers outside the LAN by explicit address. Pairing "
+            "happens on the LAN first; unpaired Internet dials are refused. "
+            "No discovery runs over the Internet.")
+        internet_detail.setObjectName("PageSubtitle")
+        internet_detail.setWordWrap(True)
+        internet_layout.addWidget(internet_detail)
+        self.internet_list = QListWidget()
+        self.internet_list.setAccessibleName("Internet peer entries")
+        self.internet_list.setMaximumHeight(110)
+        internet_layout.addWidget(self.internet_list)
+        internet_form = QGridLayout()
+        internet_form.addWidget(QLabel("Paired session"), 0, 0)
+        self.internet_session = QComboBox()
+        self.internet_session.setAccessibleName("Paired session for entry")
+        internet_form.addWidget(self.internet_session, 0, 1)
+        internet_form.addWidget(QLabel("Label"), 1, 0)
+        self.internet_label = QLineEdit()
+        self.internet_label.setMaxLength(80)
+        internet_form.addWidget(self.internet_label, 1, 1)
+        internet_form.addWidget(QLabel("Host"), 2, 0)
+        self.internet_host = QLineEdit()
+        self.internet_host.setMaxLength(255)
+        self.internet_host.setPlaceholderText("Public host or address")
+        internet_form.addWidget(self.internet_host, 2, 1)
+        internet_form.addWidget(QLabel("Port"), 3, 0)
+        self.internet_port = QSpinBox()
+        self.internet_port.setRange(1, 65535)
+        self.internet_port.setValue(50003)
+        internet_form.addWidget(self.internet_port, 3, 1)
+        internet_layout.addLayout(internet_form)
+        internet_actions = QHBoxLayout()
+        self.internet_add = action_button(
+            "Add entry", self._add_internet_peer, True)
+        self.internet_remove = action_button(
+            "Remove entry", self._remove_internet_peer)
+        internet_actions.addWidget(self.internet_add)
+        internet_actions.addWidget(self.internet_remove)
+        internet_actions.addStretch(1)
+        internet_layout.addLayout(internet_actions)
+        layout.addWidget(internet)
+        self._refresh_internet_list()
         publications = QFrame()
         publications.setProperty("card", True)
         publication_layout = QVBoxLayout(publications)
@@ -2251,11 +2299,21 @@ class MainWindow(QMainWindow):
         """Queue a room or direct message without blocking the GUI."""
         text = self.input.text()
         selected = self.recipient.currentData()
-        peers = tuple(record.as_peer()
-                      for record in self.service.peer_repository.supporting("chat_v1")
-                      if selected is None or record.session_id == selected)
         try:
-            self.service.send(text, peers, selected is not None)
+            internet = self._internet_peer_for(selected)
+        except (ValueError, RuntimeError) as error:
+            self.append(str(error), "Messages", "warning")
+            return
+        if internet is not None:
+            peers: tuple[Peer, ...] = (internet,)
+            direct = True
+        else:
+            peers = tuple(record.as_peer()
+                          for record in self.service.peer_repository.supporting("chat_v1")
+                          if selected is None or record.session_id == selected)
+            direct = selected is not None
+        try:
+            self.service.send(text, peers, direct)
         except (ValueError, RuntimeError) as error:
             self.append(str(error), "Messages", "warning")
             return
@@ -2421,6 +2479,19 @@ class MainWindow(QMainWindow):
         if current_trust != previous_trust:
             self.refresh_feed()
 
+    def _rebuild_internet_entries(self, combo: QComboBox, capability: str,
+                                  selected: object) -> None:
+        """Append address book entries advertising one capability."""
+        for entry in self.service.address_book.snapshot():
+            if capability not in entry.capabilities:
+                continue
+            combo.addItem(f"Internet · {entry.label} · {entry.host}",
+                          ("inet", entry.peer_id))
+        if selected is not None:
+            index = combo.findData(selected)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+
     def _rebuild_message_recipients(self, selected: object) -> None:
         self.recipient.blockSignals(True)
         self.recipient.clear()
@@ -2435,6 +2506,7 @@ class MainWindow(QMainWindow):
             self.recipient.addItem(
                 f"Direct · {record.hello.name} · {record.ip} · {security}",
                 record.session_id)
+        self._rebuild_internet_entries(self.recipient, "chat_v1", selected)
         index = self.recipient.findData(selected)
         if selected is not None and index < 0:
             self.recipient.addItem("Selected session is no longer nearby", selected)
@@ -2450,27 +2522,120 @@ class MainWindow(QMainWindow):
                 continue
             self.directory_peer.addItem(
                 f"{record.hello.name} · {record.ip}", record.session_id)
+        self._rebuild_internet_entries(
+            self.directory_peer, "directory_v1", selected)
         index = self.directory_peer.findData(selected)
         self.directory_peer.setCurrentIndex(max(0, index))
+
+    def _internet_peer_for(self, data: object) -> Peer | None:
+        """Dial one address book entry, returning None for LAN selections."""
+        if (not isinstance(data, tuple) or len(data) != 2
+                or data[0] != "inet" or not isinstance(data[1], str)):
+            return None
+        return self.service.dial_peer(data[1])
+
+    def _refresh_internet_list(self) -> None:
+        """Render address book entries with live paired state."""
+        transport = self.service.secure_transport
+        self.internet_session.blockSignals(True)
+        self.internet_session.clear()
+        self.internet_session.addItem("Select one paired session", None)
+        for record in self.peer_records:
+            if not record.nearby or record.trust_state is not TrustState.PAIRED:
+                continue
+            self.internet_session.addItem(
+                f"{record.hello.name} · {record.ip}", record.hello.peer_id)
+        self.internet_session.blockSignals(False)
+        self.internet_list.clear()
+        for entry in self.service.address_book.snapshot():
+            record = (transport.trust_store.get(entry.peer_id)
+                      if transport is not None else None)
+            if record is None:
+                state = "Unpaired · dial blocked"
+            elif record.fingerprint != entry.fingerprint:
+                state = "Key changed · re-add entry"
+            else:
+                state = "Paired"
+            item = QListWidgetItem(
+                f"{entry.label} · {entry.host}:{entry.port} · {state}")
+            item.setData(Qt.ItemDataRole.UserRole, entry.peer_id)
+            self.internet_list.addItem(item)
+
+    @Slot()
+    def _add_internet_peer(self) -> None:
+        """Bind one paired session to an explicit Internet dial target."""
+        transport = self.service.secure_transport
+        peer_id = self.internet_session.currentData()
+        if not isinstance(peer_id, str) or transport is None:
+            self.append("Select one paired session before adding an entry.",
+                        "Network", "warning")
+            return
+        record = next((item for item in self.peer_records
+                       if item.hello.peer_id == peer_id and item.nearby), None)
+        trust = transport.trust_store.get(peer_id)
+        if record is None or trust is None:
+            self.append("Entry peers must be paired; pair on LAN first.",
+                        "Network", "warning")
+            return
+        host = self.internet_host.text().strip()
+        label = self.internet_label.text().strip() or record.hello.name
+        try:
+            self.service.address_book.add(
+                peer_id, label, host, self.internet_port.value(),
+                record.hello.capabilities, trust.fingerprint)
+        except ValueError as error:
+            self.append(f"Entry rejected: {error}", "Network", "warning")
+            return
+        self._refresh_internet_list()
+        self._update_peer_records(self.peer_records)
+        self.append(f"Internet entry {label!r} added.", "Network")
+
+    @Slot()
+    def _remove_internet_peer(self) -> None:
+        """Forget one explicit dial entry without touching paired trust."""
+        item = self.internet_list.currentItem()
+        peer_id = (item.data(Qt.ItemDataRole.UserRole)
+                   if item is not None else None)
+        if not isinstance(peer_id, str):
+            return
+        if self.service.address_book.remove(peer_id):
+            self._refresh_internet_list()
+            self._update_peer_records(self.peer_records)
+            self.append("Internet entry removed.", "Network", "warning")
 
     @Slot()
     def _sync_directory(self) -> None:
         """Queue a catalog sync from the explicitly selected capable peer."""
         selected = self.directory_peer.currentData()
-        record = self.service.peer_repository.get(
-            selected if isinstance(selected, str) else None)
-        if (record is None or not record.nearby
-                or "directory_v1" not in record.hello.capabilities):
-            self.append("Select one directory-capable peer before syncing.",
-                        "Services", "warning")
-            return
         try:
-            identifier = self.service.sync_directory(record.as_peer())
+            internet = self._internet_peer_for(selected)
+        except (ValueError, RuntimeError) as error:
+            self.append(str(error), "Services", "warning")
+            return
+        if internet is not None:
+            if "directory_v1" not in internet.hello.capabilities:
+                self.append("Selected entry does not share its catalog.",
+                            "Services", "warning")
+                return
+            peer = internet
+            name = internet.hello.name
+        else:
+            record = self.service.peer_repository.get(
+                selected if isinstance(selected, str) else None)
+            if (record is None or not record.nearby
+                    or "directory_v1" not in record.hello.capabilities):
+                self.append("Select one directory-capable peer before syncing.",
+                            "Services", "warning")
+                return
+            peer = record.as_peer()
+            name = record.hello.name
+        try:
+            identifier = self.service.sync_directory(peer)
         except (ValueError, RuntimeError) as error:
             self.append(str(error), "Services", "warning")
             return
         self.append(f"Directory sync {identifier[:8]}… queued from "
-                    f"{record.hello.name}.", "Services")
+                    f"{name}.", "Services")
 
     def _rebuild_feed_peers(self, selected: object) -> None:
         self.feed_peer.clear()
@@ -2485,6 +2650,7 @@ class MainWindow(QMainWindow):
             self.feed_peer.addItem(
                 f"{record.hello.name} · {record.ip} · {security}",
                 record.session_id)
+        self._rebuild_internet_entries(self.feed_peer, "posts_v1", selected)
         index = self.feed_peer.findData(selected)
         self.feed_peer.setCurrentIndex(max(0, index))
 
@@ -2778,9 +2944,12 @@ class MainWindow(QMainWindow):
                         "Security", "warning")
 
     def _show_pair_request(self, candidate: PairingCandidate) -> None:
+        source = (f"Source endpoint: {candidate.source_ip}\n\n"
+                  if candidate.source_ip else "")
         answer = QMessageBox.question(
             self, "Incoming pairing request",
             f"{candidate.name} requests certificate pairing.\n\n"
+            f"{source}"
             f"Comparison code: {candidate.comparison_code}\n\n"
             "Accept only after the same code is confirmed on the other device.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -3077,6 +3246,14 @@ class MainWindow(QMainWindow):
     def send_file(self) -> None:
         """Select a source file for one explicitly selected chat peer."""
         selected = self.recipient.currentData()
+        try:
+            internet = self._internet_peer_for(selected)
+        except (ValueError, RuntimeError) as error:
+            self.append(str(error), "Transfers", "warning")
+            return
+        if internet is not None:
+            self._send_file_to_peer(internet)
+            return
         record = self.service.peer_repository.get(
             selected if isinstance(selected, str) else None)
         if record is None or not record.nearby:
@@ -3145,14 +3322,26 @@ class MainWindow(QMainWindow):
     def sync_feed(self) -> None:
         """Queue feed paging from the explicitly selected capable peer."""
         selected = self.feed_peer.currentData()
-        record = self.service.peer_repository.get(
-            selected if isinstance(selected, str) else None)
-        if (record is None or not record.nearby
-                or "posts_v1" not in record.hello.capabilities):
-            self.append("Select one posts-capable peer before syncing.",
-                        "Feed", "warning")
+        try:
+            internet = self._internet_peer_for(selected)
+        except (ValueError, RuntimeError) as error:
+            self.append(str(error), "Feed", "warning")
             return
-        peer = record.as_peer()
+        if internet is not None:
+            if "posts_v1" not in internet.hello.capabilities:
+                self.append("Selected entry does not share posts.",
+                            "Feed", "warning")
+                return
+            peer = internet
+        else:
+            record = self.service.peer_repository.get(
+                selected if isinstance(selected, str) else None)
+            if (record is None or not record.nearby
+                    or "posts_v1" not in record.hello.capabilities):
+                self.append("Select one posts-capable peer before syncing.",
+                            "Feed", "warning")
+                return
+            peer = record.as_peer()
         try:
             identifier = self.service.sync_posts(peer)
         except (ValueError, RuntimeError) as error:

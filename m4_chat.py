@@ -74,6 +74,8 @@ def main() -> int:
                         default=root / "lan-manager/identity.pem")
     parser.add_argument("--trust-file", type=Path,
                         default=root / "lan-manager/trust.json")
+    parser.add_argument("--addressbook-file", type=Path,
+                        default=root / "lan-manager/addressbook.json")
     parser.add_argument("--post-file", type=Path, default=root / "lan-manager/posts.jsonl")
     args = parser.parse_args()
     if args.discovery_auto and args.source_address:
@@ -107,7 +109,8 @@ def main() -> int:
                               secure_transport=secure_transport,
                               discovery_source_addresses=sources,
                               discovery_include_fallback=fallback,
-                              directory=LocalServiceDirectory(hello))
+                              directory=LocalServiceDirectory(hello),
+                              address_book=args.addressbook_file)
     except (ValueError, OSError) as error:
         logging.error("Startup failed: %s", error)
         return 1
