@@ -25,6 +25,7 @@ from core.identity import (
 )
 from core.protocol import ProtocolError, recv_message, send_message
 from core.roster import Peer
+from core.scope import resolve_host
 from core.trust import KeyChangedError, TrustStore
 
 SECURE_PORT = 50003
@@ -80,6 +81,7 @@ class PairingCandidate:
     fingerprint: str
     comparison_code: str
     created: float
+    source_ip: str = ""
 
 
 class SecureTransport:
@@ -164,8 +166,81 @@ class SecureTransport:
             _close_sockets(tls_socket, raw_socket)
             raise SecureTransportError("secure connection failed") from error
 
-    def accept(self, raw_socket: socket.socket) -> SecureChannel | None:
+    def probe_session(self, host: str, port: int,
+                      peer_id: str) -> tuple[str, str]:
+        """Learn one paired peer's live session and pinned address."""
+        record = self.trust_store.get(peer_id)
+        if record is None:
+            raise SecureTransportError("peer is not paired")
+        try:
+            targets = resolve_host(host)
+        except ValueError as error:
+            raise SecureTransportError(f"probe target invalid: {error}") from error
+        error: Exception | None = None
+        for target in targets:
+            try:
+                return (self._probe_one(target, port, record.peer_id,
+                                        record.certificate_der,
+                                        record.fingerprint), target)
+            except (OSError, SecureTransportError, ValueError) as exc:
+                error = exc
+                continue
+        assert error is not None
+        raise error
+
+    def _probe_one(self, host: str, port: int, peer_id: str,
+                   certificate_der: bytes, fingerprint: str) -> str:
+        """Complete one TLS handshake and return the live session ID."""
+        tls_socket: ssl.SSLSocket | None = None
+        raw_socket: socket.socket | None = None
+        try:
+            raw_socket = socket.create_connection(
+                (host, port), timeout=CONNECT_TIMEOUT)
+            raw_socket.settimeout(HANDSHAKE_TIMEOUT)
+            tls_socket = self._client_context.wrap_socket(
+                raw_socket, server_hostname=None, do_handshake_on_connect=False)
+            raw_socket = None
+            self._observe_socket(tls_socket, True)
+            tls_socket.do_handshake()
+            presented = _peer_certificate(tls_socket)
+            presented_fingerprint = _certificate_fingerprint(
+                presented, peer_id)
+            if (presented != certificate_der
+                    or presented_fingerprint != fingerprint
+                    or not self.trust_store.verify(peer_id, presented)):
+                raise SecureTransportError("TLS certificate does not match trust")
+            frame = _receive_frame(tls_socket)
+            _require_frame(frame, "SECURE_CHALLENGE",
+                           {"version", "type", "nonce", "peer_id",
+                            "session_id", "fingerprint"})
+            _validate_nonce(frame["nonce"])
+            if (_canonical_uuid(frame["peer_id"], "peer_id") != peer_id
+                    or _validate_fingerprint(frame["fingerprint"])
+                    != fingerprint):
+                raise SecureTransportError("challenge differs from paired peer")
+            return _canonical_uuid(frame["session_id"], "session_id")
+        except SecureTransportError:
+            self._observe_socket(tls_socket, False)
+            _close_sockets(tls_socket, raw_socket)
+            raise
+        except (OSError, ssl.SSLError, ProtocolError, TimeoutError,
+                IdentityError, ValueError) as error:
+            self._observe_socket(tls_socket, False)
+            _close_sockets(tls_socket, raw_socket)
+            raise SecureTransportError("session probe failed") from error
+        finally:
+            self._observe_socket(tls_socket, False)
+            _close_sockets(tls_socket, raw_socket)
+
+    def accept(self, raw_socket: socket.socket,
+               allow_pairing: bool = True) -> SecureChannel | None:
         """TLS-wrap one accepted socket and authenticate or stage its peer."""
+        if type(allow_pairing) is not bool:
+            raise ValueError("allow_pairing must be bool")
+        try:
+            source_ip = raw_socket.getpeername()[0]
+        except OSError:
+            source_ip = ""
         tls_socket: ssl.SSLSocket | None = None
         try:
             raw_socket.settimeout(HANDSHAKE_TIMEOUT)
@@ -194,7 +269,10 @@ class SecureTransport:
                 return SecureChannel(tls_socket, peer_id, session_id,
                                      fingerprint)
             if frame_type == "PAIR_REQUEST":
-                candidate = self._stage_pairing(frame, nonce)
+                if not allow_pairing:
+                    raise SecureTransportError(
+                        "internet pairing refused; pair on LAN first")
+                candidate = self._stage_pairing(frame, nonce, source_ip)
                 self._emit_pairing(candidate)
                 send_message(tls_socket, {
                     "version": SECURITY_VERSION,
@@ -363,8 +441,8 @@ class SecureTransport:
             raise SecureTransportError("authentication signature is invalid")
         return peer_id, session_id, fingerprint
 
-    def _stage_pairing(self, frame: dict[str, object],
-                       nonce: str) -> PairingCandidate:
+    def _stage_pairing(self, frame: dict[str, object], nonce: str,
+                       source_ip: str = "") -> PairingCandidate:
         required = {"version", "type", "request_id", "peer_id",
                     "session_id", "name", "certificate_der", "fingerprint",
                     "signature"}
@@ -389,7 +467,7 @@ class SecureTransport:
         candidate = PairingCandidate(
             request_id, peer_id, session_id, name, certificate_der, fingerprint,
             _comparison_code(nonce, self.identity.fingerprint, fingerprint),
-            time.monotonic())
+            time.monotonic(), source_ip)
         with self._pending_lock:
             self._expire_pending_locked(candidate.created)
             if request_id in self._pending:
